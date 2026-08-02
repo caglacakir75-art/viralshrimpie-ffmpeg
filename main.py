@@ -14,7 +14,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, HttpUrl
 
-app = FastAPI(title="ViralShrimpie FFmpeg Renderer", version="1.6.0")
+app = FastAPI(title="ViralShrimpie FFmpeg Renderer", version="1.6.1")
 
 BASE_DIR = Path(os.getenv("JOB_DIR", "/tmp/viralshrimpie_jobs"))
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -390,28 +390,27 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
                 audio_duration - MUSIC_FADE_SECONDS,
             )
 
+            # Keep the mix intentionally simple and memory-safe on Render Free.
+            # -stream_loop loops the music input, so aloop is unnecessary.
+            # At 0.08 volume, music stays behind narration without sidechain.
             filter_complex = (
-                f"[1:a]{voice_filter}[voice];"
+                f"[1:a]{voice_filter},"
+                f"aresample=48000[voice];"
                 f"[2:a]"
-                f"atrim=start={music_start:.3f},"
+                f"atrim=start={music_start:.3f}:"
+                f"duration={audio_duration:.3f},"
                 f"asetpts=N/SR/TB,"
-                f"aloop=loop=-1:size=2147483647,"
-                f"atrim=0:{audio_duration:.3f},"
+                f"aresample=48000,"
                 f"afade=t=in:st=0:d={MUSIC_FADE_SECONDS},"
                 f"afade=t=out:"
                 f"st={music_fade_out_start:.3f}:"
                 f"d={MUSIC_FADE_SECONDS},"
                 f"volume={payload.music_volume}[music];"
-                f"[music][voice]"
-                f"sidechaincompress="
-                f"threshold=0.025:"
-                f"ratio=8:"
-                f"attack=20:"
-                f"release=300[ducked];"
-                f"[voice][ducked]"
+                f"[voice][music]"
                 f"amix=inputs=2:"
                 f"duration=first:"
-                f"dropout_transition=0[aout]"
+                f"dropout_transition=0:"
+                f"normalize=0[aout]"
             )
 
             run([
@@ -460,7 +459,7 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "ViralShrimpie FFmpeg Renderer", "version": "1.6.0"}
+    return {"ok": True, "service": "ViralShrimpie FFmpeg Renderer", "version": "1.6.1"}
 
 
 @app.get("/health")
