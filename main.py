@@ -14,7 +14,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, HttpUrl
 
-app = FastAPI(title="ViralShrimpie FFmpeg Renderer", version="1.8.3")
+app = FastAPI(title="ViralShrimpie FFmpeg Renderer", version="1.9.0")
 
 BASE_DIR = Path(os.getenv("JOB_DIR", "/tmp/viralshrimpie_jobs"))
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -57,7 +57,7 @@ THUMBNAIL_TEXT_PANEL_WIDTH = 740
 
 
 class RenderRequest(BaseModel):
-    video_urls: List[HttpUrl] = Field(min_length=4, max_length=4)
+    video_urls: List[HttpUrl] = Field(min_length=12, max_length=12)
     audio_url: HttpUrl
     music_url: HttpUrl | None = None
     music_urls: List[HttpUrl] | None = None
@@ -311,7 +311,7 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
     set_job(job_id, {"status": "downloading", "progress": 5})
 
     try:
-        video_paths = [job_dir / f"video_{index + 1}.mp4" for index in range(4)]
+        video_paths = [job_dir / f"video_{index + 1}.mp4" for index in range(12)]
         audio_path = job_dir / "voiceover.mp3"
         music_path = job_dir / "background_music.mp3"
 
@@ -347,112 +347,136 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
         durations = weighted_durations(payload.scene_texts, audio_duration)
         font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
         rendered_paths = []
+        clip_counter = 0
 
-        for index, (source, duration, text) in enumerate(
-            zip(video_paths, durations, payload.scene_texts), start=1
+        for scene_index, (scene_duration, scene_text) in enumerate(
+            zip(durations, payload.scene_texts),
+            start=1
         ):
-            target = job_dir / f"scene_{index}.mp4"
-            rendered_paths.append(target)
+            base_clip_duration = scene_duration / 3.0
+            clip_durations = [
+                base_clip_duration,
+                base_clip_duration,
+                scene_duration - (base_clip_duration * 2),
+            ]
 
             caption, current_font_size = choose_caption_layout(
-                text=text,
-                is_hook=index == 1,
+                text=scene_text,
+                is_hook=scene_index == 1,
                 video_width=payload.width,
                 requested_font_size=payload.font_size,
             )
-            text_path = job_dir / f"scene_{index}.txt"
+
+            text_path = job_dir / f"scene_{scene_index}.txt"
             text_path.write_text(caption, encoding="utf-8")
 
-            fade = TEXT_FADE_SECONDS
-            alpha_expression = (
-                f"if(lt(t,{fade}),t/{fade},"
-                f"if(gt(t,{duration - fade}),"
-                f"({duration}-t)/{fade},1))"
-            )
+            for clip_index in range(3):
+                source = video_paths[clip_counter]
+                duration = clip_durations[clip_index]
+                clip_counter += 1
 
-            base_y = f"h-text_h-{payload.text_margin}"
-
-            if ENABLE_CAPTION_SLIDE:
-                slide = CAPTION_SLIDE_SECONDS
-                caption_y = (
-                    f"if(lt(t,{slide}),"
-                    f"({base_y})+"
-                    f"{CAPTION_SLIDE_DISTANCE}*"
-                    f"(1-t/{slide}),"
-                    f"({base_y}))"
+                target = job_dir / (
+                    f"scene_{scene_index}_clip_{clip_index + 1}.mp4"
                 )
-            else:
-                caption_y = base_y
+                rendered_paths.append(target)
 
-            filters = [
-                (
-                    f"scale={payload.width}:{payload.height}:"
-                    f"force_original_aspect_ratio=increase"
-                ),
-                f"crop={payload.width}:{payload.height}",
-            ]
+                fade = TEXT_FADE_SECONDS
+                alpha_expression = (
+                    f"if(lt(t,{fade}),t/{fade},"
+                    f"if(gt(t,{duration - fade}),"
+                    f"({duration}-t)/{fade},1))"
+                )
 
-            if ENABLE_KEN_BURNS:
+                base_y = f"h-text_h-{payload.text_margin}"
+
+                if ENABLE_CAPTION_SLIDE:
+                    slide = CAPTION_SLIDE_SECONDS
+                    caption_y = (
+                        f"if(lt(t,{slide}),"
+                        f"({base_y})+"
+                        f"{CAPTION_SLIDE_DISTANCE}*"
+                        f"(1-t/{slide}),"
+                        f"({base_y}))"
+                    )
+                else:
+                    caption_y = base_y
+
+                filters = [
+                    (
+                        f"scale={payload.width}:{payload.height}:"
+                        f"force_original_aspect_ratio=increase"
+                    ),
+                    f"crop={payload.width}:{payload.height}",
+                ]
+
+                if ENABLE_KEN_BURNS:
+                    filters.append(
+                        build_ken_burns_filter(
+                            scene_index=clip_counter,
+                            duration=duration,
+                            fps=payload.fps,
+                            width=payload.width,
+                            height=payload.height,
+                        )
+                    )
+                else:
+                    filters.append(f"fps={payload.fps}")
+
+                if ENABLE_SCENE_FADE:
+                    fade_out_start = max(
+                        0.0,
+                        duration - SCENE_FADE_SECONDS,
+                    )
+                    filters.extend(
+                        [
+                            (
+                                f"fade=t=in:st=0:"
+                                f"d={SCENE_FADE_SECONDS}"
+                            ),
+                            (
+                                f"fade=t=out:"
+                                f"st={fade_out_start:.3f}:"
+                                f"d={SCENE_FADE_SECONDS}"
+                            ),
+                        ]
+                    )
+
                 filters.append(
-                    build_ken_burns_filter(
-                        scene_index=index,
-                        duration=duration,
-                        fps=payload.fps,
-                        width=payload.width,
-                        height=payload.height,
+                    (
+                        f"drawtext=fontfile={font_path}:"
+                        f"textfile={text_path.as_posix()}:"
+                        f"fontcolor=white:"
+                        f"fontsize={current_font_size}:"
+                        f"line_spacing={TEXT_LINE_SPACING}:"
+                        f"borderw={TEXT_BORDER_WIDTH}:"
+                        f"bordercolor=black:"
+                        f"box=1:"
+                        f"boxcolor=black@{TEXT_BOX_ALPHA}:"
+                        f"boxborderw={TEXT_BOX_PADDING}:"
+                        f"alpha='{alpha_expression}':"
+                        f"x=(w-text_w)/2:"
+                        f"y='{caption_y}'"
                     )
                 )
-            else:
-                filters.append(f"fps={payload.fps}")
 
-            if ENABLE_SCENE_FADE:
-                fade_out_start = max(
-                    0.0,
-                    duration - SCENE_FADE_SECONDS,
+                video_filter = ",".join(filters)
+
+                run([
+                    "ffmpeg", "-y", "-stream_loop", "-1", "-i", str(source),
+                    "-t", f"{duration:.3f}", "-vf", video_filter, "-an",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22",
+                    "-threads", "1", "-pix_fmt", "yuv420p",
+                    "-movflags", "+faststart", str(target)
+                ])
+
+                progress = 25 + int((clip_counter / 12) * 48)
+                set_job(
+                    job_id,
+                    {
+                        "status": "rendering",
+                        "progress": progress,
+                    },
                 )
-                filters.extend(
-                    [
-                        (
-                            f"fade=t=in:st=0:"
-                            f"d={SCENE_FADE_SECONDS}"
-                        ),
-                        (
-                            f"fade=t=out:"
-                            f"st={fade_out_start:.3f}:"
-                            f"d={SCENE_FADE_SECONDS}"
-                        ),
-                    ]
-                )
-
-            filters.append(
-                (
-                    f"drawtext=fontfile={font_path}:"
-                    f"textfile={text_path.as_posix()}:"
-                    f"fontcolor=white:"
-                    f"fontsize={current_font_size}:"
-                    f"line_spacing={TEXT_LINE_SPACING}:"
-                    f"borderw={TEXT_BORDER_WIDTH}:"
-                    f"bordercolor=black:"
-                    f"box=1:"
-                    f"boxcolor=black@{TEXT_BOX_ALPHA}:"
-                    f"boxborderw={TEXT_BOX_PADDING}:"
-                    f"alpha='{alpha_expression}':"
-                    f"x=(w-text_w)/2:"
-                    f"y='{caption_y}'"
-                )
-            )
-
-            video_filter = ",".join(filters)
-
-            run([
-                "ffmpeg", "-y", "-stream_loop", "-1", "-i", str(source),
-                "-t", f"{duration:.3f}", "-vf", video_filter, "-an",
-                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22",
-                "-threads", "1", "-pix_fmt", "yuv420p", "-movflags", "+faststart",
-                str(target)
-            ])
-
-            set_job(job_id, {"status": "rendering", "progress": 25 + index * 12})
 
         concat_path = job_dir / "concat.txt"
         concat_path.write_text(
@@ -565,7 +589,9 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
             "duration": round(audio_duration, 3),
             "scene_durations": [round(value, 3) for value in durations],
             "download_url": f"/download/{job_id}",
-            "thumbnail_url": f"/thumbnail/{job_id}"
+            "thumbnail_url": f"/thumbnail/{job_id}",
+            "clips_per_scene": 3,
+            "total_clips": 12
         })
 
     except Exception as exc:
@@ -574,7 +600,7 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "ViralShrimpie FFmpeg Renderer", "version": "1.8.3"}
+    return {"ok": True, "service": "ViralShrimpie FFmpeg Renderer", "version": "1.9.0"}
 
 
 @app.get("/health")
