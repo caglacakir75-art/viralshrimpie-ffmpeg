@@ -13,7 +13,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, HttpUrl
 
-app = FastAPI(title="ViralShrimpie FFmpeg Renderer", version="1.3.0")
+app = FastAPI(title="ViralShrimpie FFmpeg Renderer", version="1.4.0")
 
 BASE_DIR = Path(os.getenv("JOB_DIR", "/tmp/viralshrimpie_jobs"))
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -21,13 +21,16 @@ JOBS: dict[str, dict] = {}
 
 HOOK_FONT_SIZE = 72
 BODY_FONT_SIZE = 66
+MIN_FONT_SIZE = 40
 BOTTOM_MARGIN = 230
 TEXT_BOX_ALPHA = 0.35
 TEXT_BOX_PADDING = 34
 TEXT_BORDER_WIDTH = 5
 TEXT_LINE_SPACING = 12
-MAX_LINE_CHARS = 28
 TEXT_FADE_SECONDS = 0.25
+
+ENABLE_KEN_BURNS = True
+KEN_BURNS_MAX_ZOOM = 1.045
 
 
 class RenderRequest(BaseModel):
@@ -100,24 +103,105 @@ def weighted_durations(texts: list[str], total: float) -> list[float]:
     return durations
 
 
-def wrap_caption(text: str, max_chars: int = MAX_LINE_CHARS) -> str:
+def wrap_for_limit(text: str, max_chars: int) -> list[str]:
     cleaned = " ".join(text.split())
-    lines = textwrap.wrap(
+    return textwrap.wrap(
         cleaned,
         width=max_chars,
         break_long_words=False,
         break_on_hyphens=False,
     )
 
-    if len(lines) > 3:
-        lines = textwrap.wrap(
-            cleaned,
-            width=max_chars + 6,
-            break_long_words=False,
-            break_on_hyphens=False,
-        )
 
-    return "\n".join(lines[:3])
+def choose_caption_layout(
+    text: str,
+    is_hook: bool,
+    video_width: int,
+) -> tuple[str, int]:
+    """
+    Selects the largest font that keeps the caption within the safe width
+    and at no more than three lines.
+    """
+    starting_size = HOOK_FONT_SIZE if is_hook else BODY_FONT_SIZE
+    font_sizes = [
+        size
+        for size in (starting_size, 66, 62, 58, 54, 50, 46, 42, MIN_FONT_SIZE)
+        if size <= starting_size
+    ]
+
+    # DejaVu Sans Bold averages roughly 0.62 x font size per character.
+    # Reserve 10% safe space on each side and account for box padding.
+    usable_width = (video_width * 0.90) - (TEXT_BOX_PADDING * 2)
+
+    for font_size in font_sizes:
+        max_chars = max(
+            16,
+            int(usable_width / (font_size * 0.62)),
+        )
+        lines = wrap_for_limit(text, max_chars)
+
+        if len(lines) <= 3:
+            return "\n".join(lines), font_size
+
+    # Emergency fallback for unusually long model output.
+    font_size = MIN_FONT_SIZE
+    max_chars = max(
+        18,
+        int(usable_width / (font_size * 0.62)),
+    )
+    lines = wrap_for_limit(text, max_chars)
+
+    # Rebalance across exactly three lines without deleting words.
+    words = " ".join(text.split()).split()
+    target = max(1, (len(words) + 2) // 3)
+    balanced = [
+        " ".join(words[index:index + target])
+        for index in range(0, len(words), target)
+    ]
+
+    if len(balanced) <= 3:
+        lines = balanced
+
+    return "\n".join(lines), font_size
+
+
+def build_ken_burns_filter(
+    scene_index: int,
+    duration: float,
+    fps: int,
+    width: int,
+    height: int,
+) -> str:
+    total_frames = max(1, int(duration * fps))
+    zoom = (
+        f"min(1+({KEN_BURNS_MAX_ZOOM - 1:.6f})"
+        f"*on/{total_frames},"
+        f"{KEN_BURNS_MAX_ZOOM:.6f})"
+    )
+
+    direction = (scene_index - 1) % 4
+
+    if direction == 0:
+        x = "iw/2-(iw/zoom/2)"
+        y = "ih/2-(ih/zoom/2)"
+    elif direction == 1:
+        x = f"(iw-iw/zoom)*on/{total_frames}"
+        y = "ih/2-(ih/zoom/2)"
+    elif direction == 2:
+        x = f"(iw-iw/zoom)*(1-on/{total_frames})"
+        y = "ih/2-(ih/zoom/2)"
+    else:
+        x = "iw/2-(iw/zoom/2)"
+        y = f"(ih-ih/zoom)*(1-on/{total_frames})"
+
+    return (
+        f"zoompan=z='{zoom}':"
+        f"x='{x}':"
+        f"y='{y}':"
+        f"d=1:"
+        f"s={width}x{height}:"
+        f"fps={fps}"
+    )
 
 
 async def render_job(job_id: str, payload: RenderRequest) -> None:
@@ -147,13 +231,13 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
             target = job_dir / f"scene_{index}.mp4"
             rendered_paths.append(target)
 
-            caption = wrap_caption(text)
+            caption, current_font_size = choose_caption_layout(
+                text=text,
+                is_hook=index == 1,
+                video_width=payload.width,
+            )
             text_path = job_dir / f"scene_{index}.txt"
             text_path.write_text(caption, encoding="utf-8")
-
-            current_font_size = (
-                HOOK_FONT_SIZE if index == 1 else payload.font_size
-            )
 
             fade = TEXT_FADE_SECONDS
             alpha_expression = (
@@ -162,19 +246,46 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
                 f"({duration}-t)/{fade},1))"
             )
 
-            video_filter = (
-                f"scale={payload.width}:{payload.height}:force_original_aspect_ratio=increase,"
-                f"crop={payload.width}:{payload.height},fps={payload.fps},"
-                f"drawtext=fontfile={font_path}:"
-                f"textfile={text_path.as_posix()}:"
-                f"fontcolor=white:fontsize={current_font_size}:"
-                f"line_spacing={TEXT_LINE_SPACING}:"
-                f"borderw={TEXT_BORDER_WIDTH}:bordercolor=black:"
-                f"box=1:boxcolor=black@{TEXT_BOX_ALPHA}:"
-                f"boxborderw={TEXT_BOX_PADDING}:"
-                f"alpha='{alpha_expression}':"
-                f"x=(w-text_w)/2:y=h-text_h-{payload.text_margin}"
+            filters = [
+                (
+                    f"scale={payload.width}:{payload.height}:"
+                    f"force_original_aspect_ratio=increase"
+                ),
+                f"crop={payload.width}:{payload.height}",
+            ]
+
+            if ENABLE_KEN_BURNS:
+                filters.append(
+                    build_ken_burns_filter(
+                        scene_index=index,
+                        duration=duration,
+                        fps=payload.fps,
+                        width=payload.width,
+                        height=payload.height,
+                    )
+                )
+            else:
+                filters.append(f"fps={payload.fps}")
+
+            filters.append(
+                (
+                    f"drawtext=fontfile={font_path}:"
+                    f"textfile={text_path.as_posix()}:"
+                    f"fontcolor=white:"
+                    f"fontsize={current_font_size}:"
+                    f"line_spacing={TEXT_LINE_SPACING}:"
+                    f"borderw={TEXT_BORDER_WIDTH}:"
+                    f"bordercolor=black:"
+                    f"box=1:"
+                    f"boxcolor=black@{TEXT_BOX_ALPHA}:"
+                    f"boxborderw={TEXT_BOX_PADDING}:"
+                    f"alpha='{alpha_expression}':"
+                    f"x=(w-text_w)/2:"
+                    f"y=h-text_h-{payload.text_margin}"
+                )
             )
+
+            video_filter = ",".join(filters)
 
             run([
                 "ffmpeg", "-y", "-stream_loop", "-1", "-i", str(source),
@@ -218,7 +329,7 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "ViralShrimpie FFmpeg Renderer", "version": "1.3.0"}
+    return {"ok": True, "service": "ViralShrimpie FFmpeg Renderer", "version": "1.4.0"}
 
 
 @app.get("/health")
