@@ -3,6 +3,7 @@ import json
 import os
 import re
 import subprocess
+import textwrap
 import uuid
 from pathlib import Path
 from typing import List
@@ -12,11 +13,21 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, HttpUrl
 
-app = FastAPI(title="ViralShrimpie FFmpeg Renderer", version="1.2.0")
+app = FastAPI(title="ViralShrimpie FFmpeg Renderer", version="1.3.0")
 
 BASE_DIR = Path(os.getenv("JOB_DIR", "/tmp/viralshrimpie_jobs"))
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 JOBS: dict[str, dict] = {}
+
+HOOK_FONT_SIZE = 72
+BODY_FONT_SIZE = 66
+BOTTOM_MARGIN = 230
+TEXT_BOX_ALPHA = 0.35
+TEXT_BOX_PADDING = 34
+TEXT_BORDER_WIDTH = 5
+TEXT_LINE_SPACING = 12
+MAX_LINE_CHARS = 28
+TEXT_FADE_SECONDS = 0.25
 
 
 class RenderRequest(BaseModel):
@@ -26,8 +37,8 @@ class RenderRequest(BaseModel):
     width: int = 1080
     height: int = 1920
     fps: int = 30
-    font_size: int = 58
-    text_margin: int = 170
+    font_size: int = BODY_FONT_SIZE
+    text_margin: int = BOTTOM_MARGIN
 
 
 def status_path(job_id: str) -> Path:
@@ -89,6 +100,26 @@ def weighted_durations(texts: list[str], total: float) -> list[float]:
     return durations
 
 
+def wrap_caption(text: str, max_chars: int = MAX_LINE_CHARS) -> str:
+    cleaned = " ".join(text.split())
+    lines = textwrap.wrap(
+        cleaned,
+        width=max_chars,
+        break_long_words=False,
+        break_on_hyphens=False,
+    )
+
+    if len(lines) > 3:
+        lines = textwrap.wrap(
+            cleaned,
+            width=max_chars + 6,
+            break_long_words=False,
+            break_on_hyphens=False,
+        )
+
+    return "\n".join(lines[:3])
+
+
 async def render_job(job_id: str, payload: RenderRequest) -> None:
     job_dir = BASE_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -116,17 +147,32 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
             target = job_dir / f"scene_{index}.mp4"
             rendered_paths.append(target)
 
+            caption = wrap_caption(text)
             text_path = job_dir / f"scene_{index}.txt"
-            text_path.write_text(text, encoding="utf-8")
+            text_path.write_text(caption, encoding="utf-8")
+
+            current_font_size = (
+                HOOK_FONT_SIZE if index == 1 else payload.font_size
+            )
+
+            fade = TEXT_FADE_SECONDS
+            alpha_expression = (
+                f"if(lt(t,{fade}),t/{fade},"
+                f"if(gt(t,{duration - fade}),"
+                f"({duration}-t)/{fade},1))"
+            )
 
             video_filter = (
                 f"scale={payload.width}:{payload.height}:force_original_aspect_ratio=increase,"
                 f"crop={payload.width}:{payload.height},fps={payload.fps},"
                 f"drawtext=fontfile={font_path}:"
                 f"textfile={text_path.as_posix()}:"
-                f"fontcolor=white:fontsize={payload.font_size}:"
-                f"borderw=4:bordercolor=black:"
-                f"box=1:boxcolor=black@0.28:boxborderw=24:"
+                f"fontcolor=white:fontsize={current_font_size}:"
+                f"line_spacing={TEXT_LINE_SPACING}:"
+                f"borderw={TEXT_BORDER_WIDTH}:bordercolor=black:"
+                f"box=1:boxcolor=black@{TEXT_BOX_ALPHA}:"
+                f"boxborderw={TEXT_BOX_PADDING}:"
+                f"alpha='{alpha_expression}':"
                 f"x=(w-text_w)/2:y=h-text_h-{payload.text_margin}"
             )
 
@@ -172,7 +218,7 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "ViralShrimpie FFmpeg Renderer", "version": "1.2.0"}
+    return {"ok": True, "service": "ViralShrimpie FFmpeg Renderer", "version": "1.3.0"}
 
 
 @app.get("/health")
