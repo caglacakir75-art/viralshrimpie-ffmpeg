@@ -14,7 +14,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, HttpUrl
 
-app = FastAPI(title="ViralShrimpie FFmpeg Renderer", version="1.9.0")
+app = FastAPI(title="ViralShrimpie FFmpeg Renderer", version="1.9.1")
 
 BASE_DIR = Path(os.getenv("JOB_DIR", "/tmp/viralshrimpie_jobs"))
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -381,15 +381,26 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
                 rendered_paths.append(target)
 
                 fade = TEXT_FADE_SECONDS
-                alpha_expression = (
-                    f"if(lt(t,{fade}),t/{fade},"
-                    f"if(gt(t,{duration - fade}),"
-                    f"({duration}-t)/{fade},1))"
-                )
+
+                # Caption belongs to the whole spoken scene, not each clip.
+                # Clip 1: fade/slide in once.
+                # Clip 2: remain fully visible and still.
+                # Clip 3: remain visible, then fade out once.
+                if clip_index == 0:
+                    alpha_expression = (
+                        f"if(lt(t,{fade}),t/{fade},1)"
+                    )
+                elif clip_index == 2:
+                    alpha_expression = (
+                        f"if(gt(t,{duration - fade}),"
+                        f"({duration}-t)/{fade},1)"
+                    )
+                else:
+                    alpha_expression = "1"
 
                 base_y = f"h-text_h-{payload.text_margin}"
 
-                if ENABLE_CAPTION_SLIDE:
+                if ENABLE_CAPTION_SLIDE and clip_index == 0:
                     slide = CAPTION_SLIDE_SECONDS
                     caption_y = (
                         f"if(lt(t,{slide}),"
@@ -600,7 +611,7 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "ViralShrimpie FFmpeg Renderer", "version": "1.9.0"}
+    return {"ok": True, "service": "ViralShrimpie FFmpeg Renderer", "version": "1.9.1"}
 
 
 @app.get("/health")
