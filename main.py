@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import random
 import re
 import subprocess
 import textwrap
@@ -13,7 +14,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, HttpUrl
 
-app = FastAPI(title="ViralShrimpie FFmpeg Renderer", version="1.5.0")
+app = FastAPI(title="ViralShrimpie FFmpeg Renderer", version="1.6.0")
 
 BASE_DIR = Path(os.getenv("JOB_DIR", "/tmp/viralshrimpie_jobs"))
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -48,6 +49,7 @@ class RenderRequest(BaseModel):
     video_urls: List[HttpUrl] = Field(min_length=4, max_length=4)
     audio_url: HttpUrl
     music_url: HttpUrl | None = None
+    music_urls: List[HttpUrl] | None = None
     music_volume: float = DEFAULT_MUSIC_VOLUME
     scene_texts: List[str] = Field(min_length=4, max_length=4)
     width: int = 1080
@@ -227,15 +229,29 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
         audio_path = job_dir / "voiceover.mp3"
         music_path = job_dir / "background_music.mp3"
 
+        selected_music_url = None
+        available_music_urls = []
+
+        if payload.music_urls:
+            available_music_urls.extend(
+                str(url) for url in payload.music_urls
+            )
+
+        if payload.music_url:
+            available_music_urls.append(str(payload.music_url))
+
+        if available_music_urls:
+            selected_music_url = random.choice(available_music_urls)
+
         async with httpx.AsyncClient() as client:
             for url, path in zip(payload.video_urls, video_paths):
                 await download_file(client, str(url), path)
             await download_file(client, str(payload.audio_url), audio_path)
 
-            if payload.music_url:
+            if selected_music_url:
                 await download_file(
                     client,
-                    str(payload.music_url),
+                    selected_music_url,
                     music_path,
                 )
 
@@ -357,7 +373,18 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
             else "anull"
         )
 
-        if payload.music_url and music_path.exists():
+        if selected_music_url and music_path.exists():
+            music_duration = probe_duration(music_path)
+            max_start = max(
+                0.0,
+                music_duration - audio_duration - 1.0,
+            )
+            music_start = (
+                random.uniform(0.0, max_start)
+                if max_start > 0
+                else 0.0
+            )
+
             music_fade_out_start = max(
                 0.0,
                 audio_duration - MUSIC_FADE_SECONDS,
@@ -366,9 +393,10 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
             filter_complex = (
                 f"[1:a]{voice_filter}[voice];"
                 f"[2:a]"
+                f"atrim=start={music_start:.3f},"
+                f"asetpts=N/SR/TB,"
                 f"aloop=loop=-1:size=2147483647,"
                 f"atrim=0:{audio_duration:.3f},"
-                f"asetpts=N/SR/TB,"
                 f"afade=t=in:st=0:d={MUSIC_FADE_SECONDS},"
                 f"afade=t=out:"
                 f"st={music_fade_out_start:.3f}:"
@@ -432,7 +460,7 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "ViralShrimpie FFmpeg Renderer", "version": "1.5.0"}
+    return {"ok": True, "service": "ViralShrimpie FFmpeg Renderer", "version": "1.6.0"}
 
 
 @app.get("/health")
