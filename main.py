@@ -14,7 +14,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, HttpUrl
 
-app = FastAPI(title="ViralShrimpie FFmpeg Renderer", version="1.7.0")
+app = FastAPI(title="ViralShrimpie FFmpeg Renderer", version="1.8.0")
 
 BASE_DIR = Path(os.getenv("JOB_DIR", "/tmp/viralshrimpie_jobs"))
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -48,6 +48,13 @@ ENABLE_CAPTION_SLIDE = True
 CAPTION_SLIDE_SECONDS = 0.22
 CAPTION_SLIDE_DISTANCE = 42
 
+THUMBNAIL_WIDTH = 1280
+THUMBNAIL_HEIGHT = 720
+THUMBNAIL_FONT_SIZE = 82
+THUMBNAIL_MAX_LINE_CHARS = 18
+THUMBNAIL_TEXT_X = 70
+THUMBNAIL_TEXT_PANEL_WIDTH = 740
+
 
 class RenderRequest(BaseModel):
     video_urls: List[HttpUrl] = Field(min_length=4, max_length=4)
@@ -55,6 +62,8 @@ class RenderRequest(BaseModel):
     music_url: HttpUrl | None = None
     music_urls: List[HttpUrl] | None = None
     music_volume: float = DEFAULT_MUSIC_VOLUME
+    thumbnail_text: str | None = None
+    title: str | None = None
     scene_texts: List[str] = Field(min_length=4, max_length=4)
     width: int = 1080
     height: int = 1920
@@ -220,6 +229,80 @@ def build_ken_burns_filter(
         f"d=1:"
         f"s={width}x{height}:"
         f"fps={fps}"
+    )
+
+
+def wrap_thumbnail_text(text: str) -> str:
+    cleaned = " ".join(text.split()).upper()
+    lines = textwrap.wrap(
+        cleaned,
+        width=THUMBNAIL_MAX_LINE_CHARS,
+        break_long_words=False,
+        break_on_hyphens=False,
+    )
+    return "\n".join(lines[:4])
+
+
+def create_thumbnail(
+    source_video: Path,
+    output_path: Path,
+    text: str,
+    job_dir: Path,
+) -> None:
+    font_path = (
+        "/usr/share/fonts/truetype/dejavu/"
+        "DejaVuSans-Bold.ttf"
+    )
+    thumbnail_text_path = job_dir / "thumbnail_text.txt"
+    thumbnail_text_path.write_text(
+        wrap_thumbnail_text(text),
+        encoding="utf-8",
+    )
+
+    filter_complex = (
+        f"[0:v]split=2[bg][fg];"
+        f"[bg]"
+        f"scale={THUMBNAIL_WIDTH}:{THUMBNAIL_HEIGHT}:"
+        f"force_original_aspect_ratio=increase,"
+        f"crop={THUMBNAIL_WIDTH}:{THUMBNAIL_HEIGHT},"
+        f"boxblur=22:10,"
+        f"eq=brightness=-0.40:saturation=0.85[bg2];"
+        f"[fg]"
+        f"scale=-2:{THUMBNAIL_HEIGHT},"
+        f"crop=500:{THUMBNAIL_HEIGHT}[fg2];"
+        f"[bg2][fg2]"
+        f"overlay=x=W-w-30:y=0,"
+        f"drawbox=x=0:y=0:"
+        f"w={THUMBNAIL_TEXT_PANEL_WIDTH}:"
+        f"h=H:"
+        f"color=black@0.28:t=fill,"
+        f"drawtext=fontfile={font_path}:"
+        f"textfile={thumbnail_text_path.as_posix()}:"
+        f"fontcolor=white:"
+        f"fontsize={THUMBNAIL_FONT_SIZE}:"
+        f"line_spacing=8:"
+        f"borderw=5:"
+        f"bordercolor=black:"
+        f"x={THUMBNAIL_TEXT_X}:"
+        f"y=(h-text_h)/2"
+    )
+
+    run(
+        [
+            "ffmpeg",
+            "-y",
+            "-ss",
+            "1.0",
+            "-i",
+            str(source_video),
+            "-frames:v",
+            "1",
+            "-filter_complex",
+            filter_complex,
+            "-q:v",
+            "3",
+            str(output_path),
+        ]
     )
 
 
@@ -463,12 +546,26 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
                 str(final_video)
             ])
 
+        thumbnail_path = job_dir / "thumbnail.jpg"
+        thumbnail_label = (
+            payload.thumbnail_text
+            or payload.title
+            or payload.scene_texts[0]
+        )
+        create_thumbnail(
+            source_video=video_paths[0],
+            output_path=thumbnail_path,
+            text=thumbnail_label,
+            job_dir=job_dir,
+        )
+
         set_job(job_id, {
             "status": "succeeded",
             "progress": 100,
             "duration": round(audio_duration, 3),
             "scene_durations": [round(value, 3) for value in durations],
-            "download_url": f"/download/{job_id}"
+            "download_url": f"/download/{job_id}",
+            "thumbnail_url": f"/thumbnail/{job_id}"
         })
 
     except Exception as exc:
@@ -477,7 +574,7 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "ViralShrimpie FFmpeg Renderer", "version": "1.7.0"}
+    return {"ok": True, "service": "ViralShrimpie FFmpeg Renderer", "version": "1.8.0"}
 
 
 @app.get("/health")
@@ -504,6 +601,31 @@ def get_status(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return {"job_id": job_id, **job}
+
+
+@app.get("/thumbnail/{job_id}")
+def thumbnail(job_id: str):
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if job.get("status") != "succeeded":
+        raise HTTPException(
+            status_code=409,
+            detail=f"Job status: {job.get('status')}",
+        )
+
+    thumbnail_path = BASE_DIR / job_id / "thumbnail.jpg"
+    if not thumbnail_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="Thumbnail not found",
+        )
+
+    return FileResponse(
+        thumbnail_path,
+        media_type="image/jpeg",
+        filename=f"viralshrimpie-{job_id}-thumbnail.jpg",
+    )
 
 
 @app.get("/download/{job_id}")
