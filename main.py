@@ -13,7 +13,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, HttpUrl
 
-app = FastAPI(title="ViralShrimpie FFmpeg Renderer", version="1.4.0")
+app = FastAPI(title="ViralShrimpie FFmpeg Renderer", version="1.5.0")
 
 BASE_DIR = Path(os.getenv("JOB_DIR", "/tmp/viralshrimpie_jobs"))
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -32,10 +32,23 @@ TEXT_FADE_SECONDS = 0.25
 ENABLE_KEN_BURNS = True
 KEN_BURNS_MAX_ZOOM = 1.045
 
+ENABLE_SCENE_FADE = True
+SCENE_FADE_SECONDS = 0.20
+
+ENABLE_AUDIO_NORMALIZATION = True
+VOICE_TARGET_LUFS = -16
+VOICE_TRUE_PEAK = -1.5
+VOICE_LRA = 11
+
+DEFAULT_MUSIC_VOLUME = 0.08
+MUSIC_FADE_SECONDS = 1.0
+
 
 class RenderRequest(BaseModel):
     video_urls: List[HttpUrl] = Field(min_length=4, max_length=4)
     audio_url: HttpUrl
+    music_url: HttpUrl | None = None
+    music_volume: float = DEFAULT_MUSIC_VOLUME
     scene_texts: List[str] = Field(min_length=4, max_length=4)
     width: int = 1080
     height: int = 1920
@@ -212,11 +225,19 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
     try:
         video_paths = [job_dir / f"video_{index + 1}.mp4" for index in range(4)]
         audio_path = job_dir / "voiceover.mp3"
+        music_path = job_dir / "background_music.mp3"
 
         async with httpx.AsyncClient() as client:
             for url, path in zip(payload.video_urls, video_paths):
                 await download_file(client, str(url), path)
             await download_file(client, str(payload.audio_url), audio_path)
+
+            if payload.music_url:
+                await download_file(
+                    client,
+                    str(payload.music_url),
+                    music_path,
+                )
 
         set_job(job_id, {"status": "rendering", "progress": 25})
 
@@ -267,6 +288,25 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
             else:
                 filters.append(f"fps={payload.fps}")
 
+            if ENABLE_SCENE_FADE:
+                fade_out_start = max(
+                    0.0,
+                    duration - SCENE_FADE_SECONDS,
+                )
+                filters.extend(
+                    [
+                        (
+                            f"fade=t=in:st=0:"
+                            f"d={SCENE_FADE_SECONDS}"
+                        ),
+                        (
+                            f"fade=t=out:"
+                            f"st={fade_out_start:.3f}:"
+                            f"d={SCENE_FADE_SECONDS}"
+                        ),
+                    ]
+                )
+
             filters.append(
                 (
                     f"drawtext=fontfile={font_path}:"
@@ -308,12 +348,75 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
              str(concat_path), "-c", "copy", str(silent_video)])
 
         final_video = job_dir / "final.mp4"
-        run([
-            "ffmpeg", "-y", "-i", str(silent_video), "-i", str(audio_path),
-            "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
-            "-c:a", "aac", "-b:a", "192k", "-shortest",
-            "-movflags", "+faststart", str(final_video)
-        ])
+
+        voice_filter = (
+            f"loudnorm=I={VOICE_TARGET_LUFS}:"
+            f"TP={VOICE_TRUE_PEAK}:"
+            f"LRA={VOICE_LRA}"
+            if ENABLE_AUDIO_NORMALIZATION
+            else "anull"
+        )
+
+        if payload.music_url and music_path.exists():
+            music_fade_out_start = max(
+                0.0,
+                audio_duration - MUSIC_FADE_SECONDS,
+            )
+
+            filter_complex = (
+                f"[1:a]{voice_filter}[voice];"
+                f"[2:a]"
+                f"aloop=loop=-1:size=2147483647,"
+                f"atrim=0:{audio_duration:.3f},"
+                f"asetpts=N/SR/TB,"
+                f"afade=t=in:st=0:d={MUSIC_FADE_SECONDS},"
+                f"afade=t=out:"
+                f"st={music_fade_out_start:.3f}:"
+                f"d={MUSIC_FADE_SECONDS},"
+                f"volume={payload.music_volume}[music];"
+                f"[music][voice]"
+                f"sidechaincompress="
+                f"threshold=0.025:"
+                f"ratio=8:"
+                f"attack=20:"
+                f"release=300[ducked];"
+                f"[voice][ducked]"
+                f"amix=inputs=2:"
+                f"duration=first:"
+                f"dropout_transition=0[aout]"
+            )
+
+            run([
+                "ffmpeg", "-y",
+                "-i", str(silent_video),
+                "-i", str(audio_path),
+                "-stream_loop", "-1",
+                "-i", str(music_path),
+                "-filter_complex", filter_complex,
+                "-map", "0:v:0",
+                "-map", "[aout]",
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-b:a", "192k",
+                "-shortest",
+                "-movflags", "+faststart",
+                str(final_video)
+            ])
+        else:
+            run([
+                "ffmpeg", "-y",
+                "-i", str(silent_video),
+                "-i", str(audio_path),
+                "-filter:a", voice_filter,
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-b:a", "192k",
+                "-shortest",
+                "-movflags", "+faststart",
+                str(final_video)
+            ])
 
         set_job(job_id, {
             "status": "succeeded",
@@ -329,7 +432,7 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "ViralShrimpie FFmpeg Renderer", "version": "1.4.0"}
+    return {"ok": True, "service": "ViralShrimpie FFmpeg Renderer", "version": "1.5.0"}
 
 
 @app.get("/health")
