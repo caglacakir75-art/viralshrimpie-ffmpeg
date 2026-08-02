@@ -14,7 +14,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, HttpUrl
 
-app = FastAPI(title="ViralShrimpie FFmpeg Renderer", version="1.8.1")
+app = FastAPI(title="ViralShrimpie FFmpeg Renderer", version="1.8.2")
 
 BASE_DIR = Path(os.getenv("JOB_DIR", "/tmp/viralshrimpie_jobs"))
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -274,7 +274,7 @@ def create_thumbnail(
         f"overlay=x=W-w-30:y=0,"
         f"drawbox=x=0:y=0:"
         f"w={THUMBNAIL_TEXT_PANEL_WIDTH}:"
-        f"h=H:"
+        f"h=ih:"
         f"color=black@0.28:t=fill,"
         f"drawtext=fontfile={font_path}:"
         f"textfile={thumbnail_text_path.as_posix()}:"
@@ -574,7 +574,7 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "ViralShrimpie FFmpeg Renderer", "version": "1.8.1"}
+    return {"ok": True, "service": "ViralShrimpie FFmpeg Renderer", "version": "1.8.2"}
 
 
 @app.get("/health")
