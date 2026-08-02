@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: viralshrimpie-ffmpeg
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    autoDeploy: true
