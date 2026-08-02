@@ -14,7 +14,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, HttpUrl
 
-app = FastAPI(title="ViralShrimpie FFmpeg Renderer", version="1.8.2")
+app = FastAPI(title="ViralShrimpie FFmpeg Renderer", version="1.8.3")
 
 BASE_DIR = Path(os.getenv("JOB_DIR", "/tmp/viralshrimpie_jobs"))
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -145,51 +145,50 @@ def choose_caption_layout(
     text: str,
     is_hook: bool,
     video_width: int,
+    requested_font_size: int,
 ) -> tuple[str, int]:
     """
     Selects the largest font that keeps the caption within the safe width
     and at no more than three lines.
     """
-    starting_size = HOOK_FONT_SIZE if is_hook else BODY_FONT_SIZE
-    font_sizes = [
-        size
-        for size in (starting_size, 66, 62, 58, 54, 50, 46, 42, MIN_FONT_SIZE)
-        if size <= starting_size
-    ]
+    configured_size = max(MIN_FONT_SIZE, requested_font_size)
+    hook_size = min(HOOK_FONT_SIZE, configured_size + 4)
+    starting_size = hook_size if is_hook else configured_size
 
-    # DejaVu Sans Bold averages roughly 0.62 x font size per character.
-    # Reserve 10% safe space on each side and account for box padding.
-    usable_width = (video_width * 0.90) - (TEXT_BOX_PADDING * 2)
+    candidates = [
+        starting_size,
+        46,
+        44,
+        42,
+        40,
+        38,
+        36,
+    ]
+    font_sizes = []
+    for size in candidates:
+        if size <= starting_size and size not in font_sizes:
+            font_sizes.append(size)
+
+    # Use a conservative safe area. The former 0.62 width estimate was too
+    # optimistic for bold capitals and caused captions to leave the frame.
+    usable_width = (video_width * 0.82) - (TEXT_BOX_PADDING * 2)
 
     for font_size in font_sizes:
         max_chars = max(
-            16,
-            int(usable_width / (font_size * 0.62)),
+            14,
+            int(usable_width / (font_size * 0.78)),
         )
         lines = wrap_for_limit(text, max_chars)
 
-        if len(lines) <= 3:
+        if len(lines) <= 4:
             return "\n".join(lines), font_size
 
-    # Emergency fallback for unusually long model output.
-    font_size = MIN_FONT_SIZE
+    font_size = 36
     max_chars = max(
-        18,
-        int(usable_width / (font_size * 0.62)),
+        14,
+        int(usable_width / (font_size * 0.78)),
     )
     lines = wrap_for_limit(text, max_chars)
-
-    # Rebalance across exactly three lines without deleting words.
-    words = " ".join(text.split()).split()
-    target = max(1, (len(words) + 2) // 3)
-    balanced = [
-        " ".join(words[index:index + target])
-        for index in range(0, len(words), target)
-    ]
-
-    if len(balanced) <= 3:
-        lines = balanced
-
     return "\n".join(lines), font_size
 
 
@@ -359,6 +358,7 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
                 text=text,
                 is_hook=index == 1,
                 video_width=payload.width,
+                requested_font_size=payload.font_size,
             )
             text_path = job_dir / f"scene_{index}.txt"
             text_path.write_text(caption, encoding="utf-8")
@@ -574,7 +574,7 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "ViralShrimpie FFmpeg Renderer", "version": "1.8.2"}
+    return {"ok": True, "service": "ViralShrimpie FFmpeg Renderer", "version": "1.8.3"}
 
 
 @app.get("/health")
