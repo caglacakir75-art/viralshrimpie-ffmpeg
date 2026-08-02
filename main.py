@@ -14,7 +14,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, HttpUrl
 
-app = FastAPI(title="ViralShrimpie FFmpeg Renderer", version="1.6.1")
+app = FastAPI(title="ViralShrimpie FFmpeg Renderer", version="1.7.0")
 
 BASE_DIR = Path(os.getenv("JOB_DIR", "/tmp/viralshrimpie_jobs"))
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -43,6 +43,10 @@ VOICE_LRA = 11
 
 DEFAULT_MUSIC_VOLUME = 0.08
 MUSIC_FADE_SECONDS = 1.0
+
+ENABLE_CAPTION_SLIDE = True
+CAPTION_SLIDE_SECONDS = 0.22
+CAPTION_SLIDE_DISTANCE = 42
 
 
 class RenderRequest(BaseModel):
@@ -283,6 +287,20 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
                 f"({duration}-t)/{fade},1))"
             )
 
+            base_y = f"h-text_h-{payload.text_margin}"
+
+            if ENABLE_CAPTION_SLIDE:
+                slide = CAPTION_SLIDE_SECONDS
+                caption_y = (
+                    f"if(lt(t,{slide}),"
+                    f"({base_y})+"
+                    f"{CAPTION_SLIDE_DISTANCE}*"
+                    f"(1-t/{slide}),"
+                    f"({base_y}))"
+                )
+            else:
+                caption_y = base_y
+
             filters = [
                 (
                     f"scale={payload.width}:{payload.height}:"
@@ -337,7 +355,7 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
                     f"boxborderw={TEXT_BOX_PADDING}:"
                     f"alpha='{alpha_expression}':"
                     f"x=(w-text_w)/2:"
-                    f"y=h-text_h-{payload.text_margin}"
+                    f"y='{caption_y}'"
                 )
             )
 
@@ -459,7 +477,7 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "ViralShrimpie FFmpeg Renderer", "version": "1.6.1"}
+    return {"ok": True, "service": "ViralShrimpie FFmpeg Renderer", "version": "1.7.0"}
 
 
 @app.get("/health")
