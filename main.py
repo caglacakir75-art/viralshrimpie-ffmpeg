@@ -14,7 +14,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, HttpUrl
 
-app = FastAPI(title="ViralShrimpie FFmpeg Renderer", version="1.9.1")
+app = FastAPI(title="ViralShrimpie FFmpeg Renderer", version="2.0.0")
 
 BASE_DIR = Path(os.getenv("JOB_DIR", "/tmp/viralshrimpie_jobs"))
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -30,7 +30,7 @@ TEXT_BORDER_WIDTH = 5
 TEXT_LINE_SPACING = 12
 TEXT_FADE_SECONDS = 0.25
 
-ENABLE_KEN_BURNS = True
+ENABLE_KEN_BURNS = False
 KEN_BURNS_MAX_ZOOM = 1.045
 
 ENABLE_SCENE_FADE = True
@@ -58,7 +58,11 @@ THUMBNAIL_TEXT_PANEL_WIDTH = 740
 
 class RenderRequest(BaseModel):
     video_urls: List[HttpUrl] = Field(min_length=12, max_length=12)
-    audio_url: HttpUrl
+    hook_audio_url: HttpUrl
+    story_audio_url: HttpUrl
+    follow_audio_url: HttpUrl
+    hook_pause: float = Field(default=1.5, ge=0.0, le=5.0)
+    outro_pause: float = Field(default=1.8, ge=0.0, le=5.0)
     music_url: HttpUrl | None = None
     music_urls: List[HttpUrl] | None = None
     music_volume: float = DEFAULT_MUSIC_VOLUME
@@ -312,7 +316,10 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
 
     try:
         video_paths = [job_dir / f"video_{index + 1}.mp4" for index in range(12)]
-        audio_path = job_dir / "voiceover.mp3"
+        hook_audio_path = job_dir / "hook_voice.mp3"
+        story_audio_path = job_dir / "story_voice.mp3"
+        follow_audio_path = job_dir / "follow_voice.mp3"
+        audio_path = job_dir / "combined_voice.wav"
         music_path = job_dir / "background_music.mp3"
 
         selected_music_url = None
@@ -332,7 +339,9 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
         async with httpx.AsyncClient() as client:
             for url, path in zip(payload.video_urls, video_paths):
                 await download_file(client, str(url), path)
-            await download_file(client, str(payload.audio_url), audio_path)
+            await download_file(client, str(payload.hook_audio_url), hook_audio_path)
+            await download_file(client, str(payload.story_audio_url), story_audio_path)
+            await download_file(client, str(payload.follow_audio_url), follow_audio_path)
 
             if selected_music_url:
                 await download_file(
@@ -343,8 +352,48 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
 
         set_job(job_id, {"status": "rendering", "progress": 25})
 
+        hook_audio_duration = probe_duration(hook_audio_path)
+        story_audio_duration = probe_duration(story_audio_path)
+        follow_audio_duration = probe_duration(follow_audio_path)
+
+        # Build one narration track with intentional pauses:
+        # hook -> pause -> story -> pause -> follow CTA.
+        run([
+            "ffmpeg", "-y",
+            "-i", str(hook_audio_path),
+            "-f", "lavfi", "-t", f"{payload.hook_pause:.3f}",
+            "-i", "anullsrc=r=48000:cl=stereo",
+            "-i", str(story_audio_path),
+            "-f", "lavfi", "-t", f"{payload.outro_pause:.3f}",
+            "-i", "anullsrc=r=48000:cl=stereo",
+            "-i", str(follow_audio_path),
+            "-filter_complex",
+            "[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a0];"
+            "[1:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a1];"
+            "[2:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a2];"
+            "[3:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a3];"
+            "[4:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a4];"
+            "[a0][a1][a2][a3][a4]concat=n=5:v=0:a=1[aout]",
+            "-map", "[aout]",
+            "-c:a", "pcm_s16le",
+            str(audio_path),
+        ])
+
         audio_duration = probe_duration(audio_path)
-        durations = weighted_durations(payload.scene_texts, audio_duration)
+
+        # Scene 1 owns the hook and its pause. Scenes 2-4 share story audio
+        # according to spoken word count. The final scene also holds the
+        # outro pause and the separate Follow for more audio.
+        story_scene_durations = weighted_durations(
+            payload.scene_texts[1:],
+            story_audio_duration,
+        )
+        durations = [
+            hook_audio_duration + payload.hook_pause,
+            story_scene_durations[0],
+            story_scene_durations[1],
+            story_scene_durations[2] + payload.outro_pause + follow_audio_duration,
+        ]
         font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
         rendered_paths = []
         clip_counter = 0
@@ -598,6 +647,11 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
             "status": "succeeded",
             "progress": 100,
             "duration": round(audio_duration, 3),
+            "hook_audio_duration": round(hook_audio_duration, 3),
+            "story_audio_duration": round(story_audio_duration, 3),
+            "follow_audio_duration": round(follow_audio_duration, 3),
+            "hook_pause": round(payload.hook_pause, 3),
+            "outro_pause": round(payload.outro_pause, 3),
             "scene_durations": [round(value, 3) for value in durations],
             "download_url": f"/download/{job_id}",
             "thumbnail_url": f"/thumbnail/{job_id}",
@@ -611,7 +665,7 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "ViralShrimpie FFmpeg Renderer", "version": "1.9.1"}
+    return {"ok": True, "service": "ViralShrimpie FFmpeg Renderer", "version": "2.0.0"}
 
 
 @app.get("/health")
