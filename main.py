@@ -14,7 +14,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, HttpUrl
 
-app = FastAPI(title="ViralShrimpie FFmpeg Renderer", version="2.0.1")
+app = FastAPI(title="ViralShrimpie FFmpeg Renderer", version="2.1.0")
 
 BASE_DIR = Path(os.getenv("JOB_DIR", "/tmp/viralshrimpie_jobs"))
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -37,8 +37,8 @@ ENABLE_SCENE_FADE = False
 SCENE_FADE_SECONDS = 0.20
 
 ENABLE_COLOR_SOFTENING = True
-VIDEO_CONTRAST = 0.97
-VIDEO_SATURATION = 0.90
+VIDEO_CONTRAST = 1.02
+VIDEO_SATURATION = 1.00
 
 ENABLE_AUDIO_NORMALIZATION = True
 VOICE_TARGET_LUFS = -16
@@ -60,19 +60,26 @@ THUMBNAIL_TEXT_X = 70
 THUMBNAIL_TEXT_PANEL_WIDTH = 740
 
 
+class StorySegment(BaseModel):
+    scene_index: int = Field(ge=1)
+    text: str = Field(min_length=1, max_length=1000)
+    audio_url: HttpUrl
+
+
 class RenderRequest(BaseModel):
-    video_urls: List[HttpUrl] = Field(min_length=12, max_length=12)
+    video_urls: List[HttpUrl] = Field(min_length=1, max_length=60)
     hook_audio_url: HttpUrl
-    story_audio_url: HttpUrl
+    hook_text: str = Field(min_length=1, max_length=300)
+    story_segments: List[StorySegment] = Field(min_length=1, max_length=20)
     follow_audio_url: HttpUrl
     hook_pause: float = Field(default=1.5, ge=0.0, le=5.0)
     outro_pause: float = Field(default=1.8, ge=0.0, le=5.0)
+    follow_text: str = Field(default="Follow for more.", min_length=1, max_length=100)
     music_url: HttpUrl | None = None
     music_urls: List[HttpUrl] | None = None
     music_volume: float = DEFAULT_MUSIC_VOLUME
     thumbnail_text: str | None = None
     title: str | None = None
-    scene_texts: List[str] = Field(min_length=4, max_length=4)
     width: int = 1080
     height: int = 1920
     fps: int = 30
@@ -319,65 +326,123 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
     set_job(job_id, {"status": "downloading", "progress": 5})
 
     try:
-        video_paths = [job_dir / f"video_{index + 1}.mp4" for index in range(12)]
+        story_segments = sorted(
+            payload.story_segments,
+            key=lambda segment: segment.scene_index,
+        )
+        expected_indexes = list(range(1, len(story_segments) + 1))
+        actual_indexes = [segment.scene_index for segment in story_segments]
+        if actual_indexes != expected_indexes:
+            raise ValueError(
+                "story_segments scene_index values must be consecutive and start at 1"
+            )
+
+        narrative_scene_count = 1 + len(story_segments)
+        if len(payload.video_urls) < narrative_scene_count:
+            raise ValueError(
+                f"At least {narrative_scene_count} video URLs are required for "
+                f"{narrative_scene_count} narrative scenes"
+            )
+
+        video_paths = [
+            job_dir / f"video_{index + 1}.mp4"
+            for index in range(len(payload.video_urls))
+        ]
         hook_audio_path = job_dir / "hook_voice.mp3"
-        story_audio_path = job_dir / "story_voice.mp3"
+        story_audio_paths = [
+            job_dir / f"story_voice_{segment.scene_index}.mp3"
+            for segment in story_segments
+        ]
         follow_audio_path = job_dir / "follow_voice.mp3"
         audio_path = job_dir / "combined_voice.wav"
         music_path = job_dir / "background_music.mp3"
 
         selected_music_url = None
-        available_music_urls = []
-
+        available_music_urls: list[str] = []
         if payload.music_urls:
-            available_music_urls.extend(
-                str(url) for url in payload.music_urls
-            )
-
+            available_music_urls.extend(str(url) for url in payload.music_urls)
         if payload.music_url:
             available_music_urls.append(str(payload.music_url))
-
         if available_music_urls:
             selected_music_url = random.choice(available_music_urls)
 
         async with httpx.AsyncClient() as client:
-            for url, path in zip(payload.video_urls, video_paths):
-                await download_file(client, str(url), path)
+            await asyncio.gather(*[
+                download_file(client, str(url), path)
+                for url, path in zip(payload.video_urls, video_paths)
+            ])
             await download_file(client, str(payload.hook_audio_url), hook_audio_path)
-            await download_file(client, str(payload.story_audio_url), story_audio_path)
+            await asyncio.gather(*[
+                download_file(client, str(segment.audio_url), path)
+                for segment, path in zip(story_segments, story_audio_paths)
+            ])
             await download_file(client, str(payload.follow_audio_url), follow_audio_path)
-
             if selected_music_url:
-                await download_file(
-                    client,
-                    selected_music_url,
-                    music_path,
-                )
+                await download_file(client, selected_music_url, music_path)
 
         set_job(job_id, {"status": "rendering", "progress": 25})
 
         hook_audio_duration = probe_duration(hook_audio_path)
-        story_audio_duration = probe_duration(story_audio_path)
+        story_audio_durations = [probe_duration(path) for path in story_audio_paths]
         follow_audio_duration = probe_duration(follow_audio_path)
 
-        # Build one narration track with intentional pauses:
-        # hook -> pause -> story -> pause -> follow CTA.
+        # Build exact narration timing:
+        # hook -> hook pause -> each story segment -> outro pause -> follow CTA.
+        audio_inputs: list[str] = ["-i", str(hook_audio_path)]
+        filter_parts = [
+            "[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a0]"
+        ]
+        concat_labels = ["[a0]"]
+        input_index = 1
+
+        if payload.hook_pause > 0:
+            audio_inputs.extend([
+                "-f", "lavfi", "-t", f"{payload.hook_pause:.3f}",
+                "-i", "anullsrc=r=48000:cl=stereo",
+            ])
+            filter_parts.append(
+                f"[{input_index}:a]aresample=48000,"
+                f"aformat=sample_fmts=fltp:channel_layouts=stereo[a{input_index}]"
+            )
+            concat_labels.append(f"[a{input_index}]")
+            input_index += 1
+
+        for path in story_audio_paths:
+            audio_inputs.extend(["-i", str(path)])
+            filter_parts.append(
+                f"[{input_index}:a]aresample=48000,"
+                f"aformat=sample_fmts=fltp:channel_layouts=stereo[a{input_index}]"
+            )
+            concat_labels.append(f"[a{input_index}]")
+            input_index += 1
+
+        if payload.outro_pause > 0:
+            audio_inputs.extend([
+                "-f", "lavfi", "-t", f"{payload.outro_pause:.3f}",
+                "-i", "anullsrc=r=48000:cl=stereo",
+            ])
+            filter_parts.append(
+                f"[{input_index}:a]aresample=48000,"
+                f"aformat=sample_fmts=fltp:channel_layouts=stereo[a{input_index}]"
+            )
+            concat_labels.append(f"[a{input_index}]")
+            input_index += 1
+
+        audio_inputs.extend(["-i", str(follow_audio_path)])
+        filter_parts.append(
+            f"[{input_index}:a]aresample=48000,"
+            f"aformat=sample_fmts=fltp:channel_layouts=stereo[a{input_index}]"
+        )
+        concat_labels.append(f"[a{input_index}]")
+        filter_parts.append(
+            "".join(concat_labels)
+            + f"concat=n={len(concat_labels)}:v=0:a=1[aout]"
+        )
+
         run([
             "ffmpeg", "-y",
-            "-i", str(hook_audio_path),
-            "-f", "lavfi", "-t", f"{payload.hook_pause:.3f}",
-            "-i", "anullsrc=r=48000:cl=stereo",
-            "-i", str(story_audio_path),
-            "-f", "lavfi", "-t", f"{payload.outro_pause:.3f}",
-            "-i", "anullsrc=r=48000:cl=stereo",
-            "-i", str(follow_audio_path),
-            "-filter_complex",
-            "[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a0];"
-            "[1:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a1];"
-            "[2:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a2];"
-            "[3:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a3];"
-            "[4:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[a4];"
-            "[a0][a1][a2][a3][a4]concat=n=5:v=0:a=1[aout]",
+            *audio_inputs,
+            "-filter_complex", ";".join(filter_parts),
             "-map", "[aout]",
             "-c:a", "pcm_s16le",
             str(audio_path),
@@ -385,85 +450,94 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
 
         audio_duration = probe_duration(audio_path)
 
-        # Scene 1 owns the hook and its pause. Scenes 2-4 share story audio
-        # according to spoken word count. The final scene also holds the
-        # outro pause and the separate Follow for more audio.
-        story_scene_durations = weighted_durations(
-            payload.scene_texts[1:],
-            story_audio_duration,
-        )
-        durations = [
-            hook_audio_duration + payload.hook_pause,
-            story_scene_durations[0],
-            story_scene_durations[1],
-            story_scene_durations[2] + payload.outro_pause + follow_audio_duration,
+        # Narrative scenes get source clips. Pause and CTA reuse the final source.
+        base_count, remainder = divmod(len(video_paths), narrative_scene_count)
+        clip_counts = [
+            base_count + (1 if index < remainder else 0)
+            for index in range(narrative_scene_count)
         ]
-        font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
-        rendered_paths = []
-        clip_counter = 0
+        scene_sources: list[list[Path]] = []
+        cursor = 0
+        for count in clip_counts:
+            scene_sources.append(video_paths[cursor:cursor + count])
+            cursor += count
 
-        for scene_index, (scene_duration, scene_text) in enumerate(
-            zip(durations, payload.scene_texts),
-            start=1
+        timeline_segments = [
+            {
+                "kind": "hook",
+                "duration": hook_audio_duration + payload.hook_pause,
+                "text": payload.story_segments[0].text if False else None,
+                "sources": scene_sources[0],
+            }
+        ]
+        # Hook text is not part of story_segments, so obtain it from the prepared
+        # scene data sent by n8n through the first visual caption fallback below.
+        # The render request intentionally keeps hook audio separate; caption text
+        # is supplied via title only if no explicit hook_text is present.
+        hook_caption = getattr(payload, "hook_text", None) or ""
+        timeline_segments[0]["text"] = hook_caption
+
+        for index, (segment, duration) in enumerate(
+            zip(story_segments, story_audio_durations),
+            start=1,
         ):
-            base_clip_duration = scene_duration / 3.0
-            clip_durations = [
-                base_clip_duration,
-                base_clip_duration,
-                scene_duration - (base_clip_duration * 2),
-            ]
+            timeline_segments.append({
+                "kind": "story",
+                "duration": duration,
+                "text": segment.text,
+                "sources": scene_sources[index],
+            })
 
-            caption, current_font_size = choose_caption_layout(
-                text=scene_text,
-                is_hook=scene_index == 1,
-                video_width=payload.width,
-                requested_font_size=payload.font_size,
-            )
+        if payload.outro_pause > 0:
+            timeline_segments.append({
+                "kind": "pause",
+                "duration": payload.outro_pause,
+                "text": "",
+                "sources": [video_paths[-1]],
+            })
 
-            text_path = job_dir / f"scene_{scene_index}.txt"
-            text_path.write_text(caption, encoding="utf-8")
+        timeline_segments.append({
+            "kind": "follow",
+            "duration": follow_audio_duration,
+            "text": payload.follow_text,
+            "sources": [video_paths[-1]],
+        })
 
-            for clip_index in range(3):
-                source = video_paths[clip_counter]
-                duration = clip_durations[clip_index]
-                clip_counter += 1
+        font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+        rendered_paths: list[Path] = []
+        rendered_clip_counter = 0
+        total_render_clips = sum(len(segment["sources"]) for segment in timeline_segments)
 
+        for timeline_index, segment in enumerate(timeline_segments, start=1):
+            segment_duration = float(segment["duration"])
+            if segment_duration <= 0:
+                continue
+            sources = segment["sources"]
+            clip_count = max(1, len(sources))
+            base_clip_duration = segment_duration / clip_count
+            clip_durations = [base_clip_duration] * clip_count
+            clip_durations[-1] += segment_duration - sum(clip_durations)
+
+            segment_text = str(segment["text"] or "").strip()
+            show_caption = bool(segment_text)
+            caption = ""
+            current_font_size = payload.font_size
+            text_path = job_dir / f"timeline_{timeline_index}.txt"
+            if show_caption:
+                caption, current_font_size = choose_caption_layout(
+                    text=segment_text,
+                    is_hook=segment["kind"] == "hook",
+                    video_width=payload.width,
+                    requested_font_size=payload.font_size,
+                )
+                text_path.write_text(caption, encoding="utf-8")
+
+            for clip_index, (source, duration) in enumerate(zip(sources, clip_durations)):
+                rendered_clip_counter += 1
                 target = job_dir / (
-                    f"scene_{scene_index}_clip_{clip_index + 1}.mp4"
+                    f"timeline_{timeline_index}_clip_{clip_index + 1}.mp4"
                 )
                 rendered_paths.append(target)
-
-                fade = TEXT_FADE_SECONDS
-
-                # Caption belongs to the whole spoken scene, not each clip.
-                # Clip 1: fade/slide in once.
-                # Clip 2: remain fully visible and still.
-                # Clip 3: remain visible, then fade out once.
-                if clip_index == 0:
-                    alpha_expression = (
-                        f"if(lt(t,{fade}),t/{fade},1)"
-                    )
-                elif clip_index == 2:
-                    alpha_expression = (
-                        f"if(gt(t,{duration - fade}),"
-                        f"({duration}-t)/{fade},1)"
-                    )
-                else:
-                    alpha_expression = "1"
-
-                base_y = f"h-text_h-{payload.text_margin}"
-
-                if ENABLE_CAPTION_SLIDE and clip_index == 0:
-                    slide = CAPTION_SLIDE_SECONDS
-                    caption_y = (
-                        f"if(lt(t,{slide}),"
-                        f"({base_y})+"
-                        f"{CAPTION_SLIDE_DISTANCE}*"
-                        f"(1-t/{slide}),"
-                        f"({base_y}))"
-                    )
-                else:
-                    caption_y = base_y
 
                 filters = [
                     (
@@ -475,14 +549,13 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
 
                 if ENABLE_COLOR_SOFTENING:
                     filters.append(
-                        f"eq=contrast={VIDEO_CONTRAST}:"
-                        f"saturation={VIDEO_SATURATION}"
+                        f"eq=contrast={VIDEO_CONTRAST}:saturation={VIDEO_SATURATION}"
                     )
 
                 if ENABLE_KEN_BURNS:
                     filters.append(
                         build_ken_burns_filter(
-                            scene_index=clip_counter,
+                            scene_index=rendered_clip_counter,
                             duration=duration,
                             fps=payload.fps,
                             width=payload.width,
@@ -493,159 +566,104 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
                     filters.append(f"fps={payload.fps}")
 
                 if ENABLE_SCENE_FADE:
-                    fade_out_start = max(
-                        0.0,
-                        duration - SCENE_FADE_SECONDS,
-                    )
-                    filters.extend(
-                        [
-                            (
-                                f"fade=t=in:st=0:"
-                                f"d={SCENE_FADE_SECONDS}"
-                            ),
-                            (
-                                f"fade=t=out:"
-                                f"st={fade_out_start:.3f}:"
-                                f"d={SCENE_FADE_SECONDS}"
-                            ),
-                        ]
-                    )
+                    fade_out_start = max(0.0, duration - SCENE_FADE_SECONDS)
+                    filters.extend([
+                        f"fade=t=in:st=0:d={SCENE_FADE_SECONDS}",
+                        (
+                            f"fade=t=out:st={fade_out_start:.3f}:"
+                            f"d={SCENE_FADE_SECONDS}"
+                        ),
+                    ])
 
-                filters.append(
-                    (
+                if show_caption:
+                    fade = min(TEXT_FADE_SECONDS, max(0.05, duration / 3))
+                    if clip_index == 0:
+                        alpha_expression = f"if(lt(t,{fade}),t/{fade},1)"
+                    elif clip_index == clip_count - 1:
+                        alpha_expression = (
+                            f"if(gt(t,{max(0.0, duration - fade):.3f}),"
+                            f"({duration:.3f}-t)/{fade},1)"
+                        )
+                    else:
+                        alpha_expression = "1"
+
+                    base_y = f"h-text_h-{payload.text_margin}"
+                    filters.append(
                         f"drawtext=fontfile={font_path}:"
                         f"textfile={text_path.as_posix()}:"
-                        f"fontcolor=white:"
-                        f"fontsize={current_font_size}:"
+                        f"fontcolor=white:fontsize={current_font_size}:"
                         f"line_spacing={TEXT_LINE_SPACING}:"
-                        f"borderw={TEXT_BORDER_WIDTH}:"
-                        f"bordercolor=black:"
-                        f"box=1:"
-                        f"boxcolor=black@{TEXT_BOX_ALPHA}:"
+                        f"borderw={TEXT_BORDER_WIDTH}:bordercolor=black:"
+                        f"box=1:boxcolor=black@{TEXT_BOX_ALPHA}:"
                         f"boxborderw={TEXT_BOX_PADDING}:"
                         f"alpha='{alpha_expression}':"
-                        f"x=(w-text_w)/2:"
-                        f"y='{caption_y}'"
+                        f"x=(w-text_w)/2:y='{base_y}'"
                     )
-                )
 
                 video_filter = ",".join(filters)
-
                 run([
                     "ffmpeg", "-y", "-stream_loop", "-1", "-i", str(source),
                     "-t", f"{duration:.3f}", "-vf", video_filter, "-an",
                     "-c:v", "libx264", "-preset", "ultrafast", "-crf", "22",
                     "-threads", "1", "-pix_fmt", "yuv420p",
-                    "-movflags", "+faststart", str(target)
+                    "-movflags", "+faststart", str(target),
                 ])
 
-                progress = 25 + int((clip_counter / 12) * 48)
-                set_job(
-                    job_id,
-                    {
-                        "status": "rendering",
-                        "progress": progress,
-                    },
-                )
+                progress = 25 + int((rendered_clip_counter / total_render_clips) * 48)
+                set_job(job_id, {"status": "rendering", "progress": progress})
 
         concat_path = job_dir / "concat.txt"
         concat_path.write_text(
             "\n".join(f"file '{path.as_posix()}'" for path in rendered_paths),
-            encoding="utf-8"
+            encoding="utf-8",
         )
-
         silent_video = job_dir / "silent.mp4"
-        run(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i",
-             str(concat_path), "-c", "copy", str(silent_video)])
+        run([
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i",
+            str(concat_path), "-c", "copy", str(silent_video),
+        ])
 
         final_video = job_dir / "final.mp4"
-
         voice_filter = (
-            f"loudnorm=I={VOICE_TARGET_LUFS}:"
-            f"TP={VOICE_TRUE_PEAK}:"
-            f"LRA={VOICE_LRA}"
+            f"loudnorm=I={VOICE_TARGET_LUFS}:TP={VOICE_TRUE_PEAK}:LRA={VOICE_LRA}"
             if ENABLE_AUDIO_NORMALIZATION
             else "anull"
         )
 
         if selected_music_url and music_path.exists():
             music_duration = probe_duration(music_path)
-            max_start = max(
-                0.0,
-                music_duration - audio_duration - 1.0,
-            )
-            music_start = (
-                random.uniform(0.0, max_start)
-                if max_start > 0
-                else 0.0
-            )
-
-            music_fade_out_start = max(
-                0.0,
-                audio_duration - MUSIC_FADE_SECONDS,
-            )
-
-            # Keep the mix intentionally simple and memory-safe on Render Free.
-            # -stream_loop loops the music input, so aloop is unnecessary.
-            # At 0.08 volume, music stays behind narration without sidechain.
+            max_start = max(0.0, music_duration - audio_duration - 1.0)
+            music_start = random.uniform(0.0, max_start) if max_start > 0 else 0.0
+            music_fade_out_start = max(0.0, audio_duration - MUSIC_FADE_SECONDS)
             filter_complex = (
-                f"[1:a]{voice_filter},"
-                f"aresample=48000[voice];"
-                f"[2:a]"
-                f"atrim=start={music_start:.3f}:"
-                f"duration={audio_duration:.3f},"
-                f"asetpts=N/SR/TB,"
-                f"aresample=48000,"
+                f"[1:a]{voice_filter},aresample=48000[voice];"
+                f"[2:a]atrim=start={music_start:.3f}:duration={audio_duration:.3f},"
+                f"asetpts=N/SR/TB,aresample=48000,"
                 f"afade=t=in:st=0:d={MUSIC_FADE_SECONDS},"
-                f"afade=t=out:"
-                f"st={music_fade_out_start:.3f}:"
-                f"d={MUSIC_FADE_SECONDS},"
+                f"afade=t=out:st={music_fade_out_start:.3f}:d={MUSIC_FADE_SECONDS},"
                 f"volume={payload.music_volume}[music];"
-                f"[voice][music]"
-                f"amix=inputs=2:"
-                f"duration=first:"
-                f"dropout_transition=0:"
-                f"normalize=0[aout]"
+                f"[voice][music]amix=inputs=2:duration=first:"
+                f"dropout_transition=0:normalize=0[aout]"
             )
-
             run([
-                "ffmpeg", "-y",
-                "-i", str(silent_video),
-                "-i", str(audio_path),
-                "-stream_loop", "-1",
-                "-i", str(music_path),
+                "ffmpeg", "-y", "-i", str(silent_video), "-i", str(audio_path),
+                "-stream_loop", "-1", "-i", str(music_path),
                 "-filter_complex", filter_complex,
-                "-map", "0:v:0",
-                "-map", "[aout]",
-                "-c:v", "copy",
-                "-c:a", "aac",
-                "-b:a", "192k",
-                "-shortest",
-                "-movflags", "+faststart",
-                str(final_video)
+                "-map", "0:v:0", "-map", "[aout]",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                "-shortest", "-movflags", "+faststart", str(final_video),
             ])
         else:
             run([
-                "ffmpeg", "-y",
-                "-i", str(silent_video),
-                "-i", str(audio_path),
+                "ffmpeg", "-y", "-i", str(silent_video), "-i", str(audio_path),
                 "-filter:a", voice_filter,
-                "-map", "0:v:0",
-                "-map", "1:a:0",
-                "-c:v", "copy",
-                "-c:a", "aac",
-                "-b:a", "192k",
-                "-shortest",
-                "-movflags", "+faststart",
-                str(final_video)
+                "-map", "0:v:0", "-map", "1:a:0",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                "-shortest", "-movflags", "+faststart", str(final_video),
             ])
 
         thumbnail_path = job_dir / "thumbnail.jpg"
-        thumbnail_label = (
-            payload.thumbnail_text
-            or payload.title
-            or payload.scene_texts[0]
-        )
+        thumbnail_label = payload.thumbnail_text or payload.title or payload.follow_text
         create_thumbnail(
             source_video=video_paths[0],
             output_path=thumbnail_path,
@@ -658,15 +676,15 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
             "progress": 100,
             "duration": round(audio_duration, 3),
             "hook_audio_duration": round(hook_audio_duration, 3),
-            "story_audio_duration": round(story_audio_duration, 3),
+            "story_audio_durations": [round(value, 3) for value in story_audio_durations],
             "follow_audio_duration": round(follow_audio_duration, 3),
             "hook_pause": round(payload.hook_pause, 3),
             "outro_pause": round(payload.outro_pause, 3),
-            "scene_durations": [round(value, 3) for value in durations],
+            "story_segment_count": len(story_segments),
             "download_url": f"/download/{job_id}",
             "thumbnail_url": f"/thumbnail/{job_id}",
-            "clips_per_scene": 3,
-            "total_clips": 12
+            "total_source_videos": len(video_paths),
+            "total_rendered_clips": len(rendered_paths),
         })
 
     except Exception as exc:
@@ -675,7 +693,7 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "ViralShrimpie FFmpeg Renderer", "version": "2.0.1"}
+    return {"ok": True, "service": "ViralShrimpie FFmpeg Renderer", "version": "2.1.0"}
 
 
 @app.get("/health")
