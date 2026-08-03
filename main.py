@@ -14,13 +14,13 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, HttpUrl
 
-app = FastAPI(title="ViralShrimpie FFmpeg Renderer", version="2.0.0")
+app = FastAPI(title="ViralShrimpie FFmpeg Renderer", version="2.0.1")
 
 BASE_DIR = Path(os.getenv("JOB_DIR", "/tmp/viralshrimpie_jobs"))
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 JOBS: dict[str, dict] = {}
 
-HOOK_FONT_SIZE = 72
+HOOK_FONT_SIZE = 60
 BODY_FONT_SIZE = 66
 MIN_FONT_SIZE = 40
 BOTTOM_MARGIN = 230
@@ -33,8 +33,12 @@ TEXT_FADE_SECONDS = 0.25
 ENABLE_KEN_BURNS = False
 KEN_BURNS_MAX_ZOOM = 1.045
 
-ENABLE_SCENE_FADE = True
+ENABLE_SCENE_FADE = False
 SCENE_FADE_SECONDS = 0.20
+
+ENABLE_COLOR_SOFTENING = True
+VIDEO_CONTRAST = 0.97
+VIDEO_SATURATION = 0.90
 
 ENABLE_AUDIO_NORMALIZATION = True
 VOICE_TARGET_LUFS = -16
@@ -44,7 +48,7 @@ VOICE_LRA = 11
 DEFAULT_MUSIC_VOLUME = 0.08
 MUSIC_FADE_SECONDS = 1.0
 
-ENABLE_CAPTION_SLIDE = True
+ENABLE_CAPTION_SLIDE = False
 CAPTION_SLIDE_SECONDS = 0.22
 CAPTION_SLIDE_DISTANCE = 42
 
@@ -156,7 +160,7 @@ def choose_caption_layout(
     and at no more than three lines.
     """
     configured_size = max(MIN_FONT_SIZE, requested_font_size)
-    hook_size = min(HOOK_FONT_SIZE, configured_size + 4)
+    hook_size = HOOK_FONT_SIZE
     starting_size = hook_size if is_hook else configured_size
 
     candidates = [
@@ -469,6 +473,12 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
                     f"crop={payload.width}:{payload.height}",
                 ]
 
+                if ENABLE_COLOR_SOFTENING:
+                    filters.append(
+                        f"eq=contrast={VIDEO_CONTRAST}:"
+                        f"saturation={VIDEO_SATURATION}"
+                    )
+
                 if ENABLE_KEN_BURNS:
                     filters.append(
                         build_ken_burns_filter(
@@ -665,7 +675,7 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "ViralShrimpie FFmpeg Renderer", "version": "2.0.0"}
+    return {"ok": True, "service": "ViralShrimpie FFmpeg Renderer", "version": "2.0.1"}
 
 
 @app.get("/health")
