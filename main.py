@@ -14,7 +14,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, HttpUrl
 
-app = FastAPI(title="Channel Factory FFmpeg Renderer", version="3.0.0")
+app = FastAPI(title="Channel Factory FFmpeg Renderer", version="3.1.0")
 
 BASE_DIR = Path(os.getenv("JOB_DIR", "/tmp/viralshrimpie_jobs"))
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -758,6 +758,64 @@ def _escape_drawtext(value: str) -> str:
     )
 
 
+def split_caption_chunks(text: str, max_words: int = 8) -> list[str]:
+    """Split spoken text into short subtitle phrases.
+
+    This is sentence/phrase-level timing, not true word alignment. It keeps
+    punctuation when possible and limits each on-screen caption to a compact
+    phrase so the subtitle follows the voice much more closely.
+    """
+    cleaned = " ".join(str(text or "").split()).strip()
+    if not cleaned:
+        return []
+
+    # First split on sentence endings and deliberate ellipsis pauses.
+    sentences = [
+        part.strip()
+        for part in re.split(r"(?<=[.!?])\s+|\s*…\s*|\s*\.\.\.\s*", cleaned)
+        if part and part.strip()
+    ]
+
+    chunks: list[str] = []
+    for sentence in sentences:
+        words = sentence.split()
+        if len(words) <= max_words:
+            chunks.append(sentence)
+            continue
+
+        # Prefer natural comma/semicolon boundaries before hard word limits.
+        clauses = [
+            clause.strip()
+            for clause in re.split(r"(?<=[,;:])\s+", sentence)
+            if clause and clause.strip()
+        ]
+
+        current: list[str] = []
+        for clause in clauses:
+            clause_words = clause.split()
+            if current and len(current) + len(clause_words) > max_words:
+                chunks.append(" ".join(current).strip())
+                current = []
+
+            if len(clause_words) <= max_words:
+                current.extend(clause_words)
+                continue
+
+            if current:
+                chunks.append(" ".join(current).strip())
+                current = []
+
+            for start in range(0, len(clause_words), max_words):
+                part = " ".join(clause_words[start:start + max_words]).strip()
+                if part:
+                    chunks.append(part)
+
+        if current:
+            chunks.append(" ".join(current).strip())
+
+    return [chunk for chunk in chunks if chunk]
+
+
 def create_phone_visual_clip(
     output_path: Path,
     duration: float,
@@ -903,24 +961,57 @@ async def render_phone_call_static_job(
         )
         visual_clips.append(intro_clip)
 
-        for index, (segment, duration) in enumerate(zip(segments, segment_durations), start=1):
-            target = job_dir / f"phone_visual_message_{index}.mp4"
-            create_phone_visual_clip(
-                output_path=target,
-                duration=duration,
-                width=payload.width,
-                height=payload.height,
-                fps=payload.fps,
-                speaker_label=payload.message.speaker_label or "Someone who cares",
-                caption_text=segment.text,
-                job_dir=job_dir,
-                clip_index=index,
-                is_intro=False,
-                requested_font_size=payload.font_size,
+        phone_clip_counter = 1
+        rendered_caption_chunks = 0
+
+        for segment_position, (segment, duration) in enumerate(
+            zip(segments, segment_durations),
+            start=1,
+        ):
+            caption_chunks = split_caption_chunks(segment.text, max_words=8)
+            if not caption_chunks:
+                caption_chunks = [segment.text]
+
+            chunk_durations = weighted_durations(caption_chunks, duration)
+
+            for chunk_position, (caption_chunk, chunk_duration) in enumerate(
+                zip(caption_chunks, chunk_durations),
+                start=1,
+            ):
+                target = job_dir / (
+                    f"phone_visual_message_{segment_position}_"
+                    f"caption_{chunk_position}.mp4"
+                )
+                create_phone_visual_clip(
+                    output_path=target,
+                    duration=chunk_duration,
+                    width=payload.width,
+                    height=payload.height,
+                    fps=payload.fps,
+                    speaker_label=(
+                        payload.message.speaker_label or "Someone who cares"
+                    ),
+                    caption_text=caption_chunk,
+                    job_dir=job_dir,
+                    clip_index=phone_clip_counter,
+                    is_intro=False,
+                    requested_font_size=payload.font_size,
+                )
+                visual_clips.append(target)
+                phone_clip_counter += 1
+                rendered_caption_chunks += 1
+
+            progress = 25 + int(
+                (segment_position / max(1, len(segments))) * 50
             )
-            visual_clips.append(target)
-            progress = 25 + int((index / max(1, len(segments))) * 50)
-            set_job(job_id, {"status": "rendering", "progress": progress, "renderer": payload.renderer})
+            set_job(
+                job_id,
+                {
+                    "status": "rendering",
+                    "progress": progress,
+                    "renderer": payload.renderer,
+                },
+            )
 
         concat_path = job_dir / "phone_concat.txt"
         concat_path.write_text(
@@ -967,6 +1058,8 @@ async def render_phone_call_static_job(
             "intro_audio_duration": round(intro_duration, 3),
             "message_audio_durations": [round(value, 3) for value in segment_durations],
             "message_segment_count": len(segments),
+            "caption_chunk_count": rendered_caption_chunks,
+            "caption_timing_mode": "weighted_phrase_v1",
             "download_url": f"/download/{job_id}",
             "thumbnail_url": f"/thumbnail/{job_id}",
         })
@@ -982,7 +1075,7 @@ async def render_phone_call_static_job(
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "Channel Factory FFmpeg Renderer", "version": "3.0.0", "renderers": ["documentary_v1", "phone_call_static_v1"]}
+    return {"ok": True, "service": "Channel Factory FFmpeg Renderer", "version": "3.1.0", "renderers": ["documentary_v1", "phone_call_static_v1"]}
 
 
 @app.get("/health")
