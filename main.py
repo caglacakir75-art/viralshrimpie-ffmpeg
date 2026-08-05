@@ -7,14 +7,14 @@ import subprocess
 import textwrap
 import uuid
 from pathlib import Path
-from typing import List
+from typing import Any, List, Literal
 
 import httpx
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, HttpUrl
 
-app = FastAPI(title="ViralShrimpie FFmpeg Renderer", version="2.1.0")
+app = FastAPI(title="Channel Factory FFmpeg Renderer", version="3.0.0")
 
 BASE_DIR = Path(os.getenv("JOB_DIR", "/tmp/viralshrimpie_jobs"))
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -66,7 +66,7 @@ class StorySegment(BaseModel):
     audio_url: HttpUrl
 
 
-class RenderRequest(BaseModel):
+class DocumentaryRenderRequest(BaseModel):
     video_urls: List[HttpUrl] = Field(min_length=1, max_length=60)
     hook_audio_url: HttpUrl
     hook_text: str = Field(min_length=1, max_length=300)
@@ -85,6 +85,64 @@ class RenderRequest(BaseModel):
     fps: int = 30
     font_size: int = BODY_FONT_SIZE
     text_margin: int = BOTTOM_MARGIN
+
+
+class PhoneIntro(BaseModel):
+    text: List[str] = Field(min_length=1, max_length=8)
+    full_text: str = Field(min_length=1, max_length=500)
+    audio_url: HttpUrl
+    duration_seconds: float = Field(default=0.0, ge=0.0, le=30.0)
+
+
+class PhoneMessageSegment(BaseModel):
+    segment_index: int = Field(ge=0, le=20)
+    segment_number: int = Field(ge=1, le=20)
+    purpose: str = Field(min_length=1, max_length=100)
+    text: str = Field(min_length=1, max_length=1500)
+    audio_url: HttpUrl
+    duration_seconds: float = Field(default=0.0, ge=0.0, le=120.0)
+
+
+class PhoneMessage(BaseModel):
+    speaker_label: str = Field(default="Someone who cares", max_length=120)
+    title: str = Field(default="You Have A Call", max_length=200)
+    full_speech: str = Field(min_length=1, max_length=8000)
+    word_count: int = Field(default=0, ge=0, le=2000)
+    segments: List[PhoneMessageSegment] = Field(min_length=1, max_length=20)
+
+
+class PhoneTimeline(BaseModel):
+    intro_start_seconds: float = Field(default=0.0, ge=0.0)
+    message_start_seconds: float = Field(default=0.0, ge=0.0)
+    estimated_total_duration_seconds: float = Field(default=0.0, ge=0.0)
+
+
+class PhoneVisual(BaseModel):
+    intro_scene: str = "incoming_phone_call"
+    intro_action: str = "person_raises_phone_to_ear"
+    message_scene: str = "phone_held_to_ear"
+    background_style: str = "cinematic_emotional_minimal"
+    subtitle_style: str = "centered_clean"
+
+
+class PhoneSafety(BaseModel):
+    fictional_emotional_experience: bool = True
+    supernatural_claim: bool = False
+    call_to_action: bool = False
+
+
+class PhoneCallRenderRequest(BaseModel):
+    renderer: Literal["phone_call_static_v1"]
+    intro: PhoneIntro
+    message: PhoneMessage
+    timeline: PhoneTimeline | None = None
+    visual: PhoneVisual | None = None
+    safety: PhoneSafety | None = None
+    width: int = Field(default=1080, ge=360, le=2160)
+    height: int = Field(default=1920, ge=640, le=3840)
+    fps: int = Field(default=30, ge=15, le=60)
+    font_size: int = Field(default=46, ge=24, le=100)
+    text_margin: int = Field(default=240, ge=40, le=700)
 
 
 def status_path(job_id: str) -> Path:
@@ -320,7 +378,7 @@ def create_thumbnail(
     )
 
 
-async def render_job(job_id: str, payload: RenderRequest) -> None:
+async def render_documentary_job(job_id: str, payload: DocumentaryRenderRequest) -> None:
     job_dir = BASE_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
     set_job(job_id, {"status": "downloading", "progress": 5})
@@ -691,9 +749,240 @@ async def render_job(job_id: str, payload: RenderRequest) -> None:
         set_job(job_id, {"status": "failed", "progress": 100, "error": str(exc)})
 
 
+def _escape_drawtext(value: str) -> str:
+    return (
+        value.replace("\\", "\\\\")
+        .replace(":", "\\:")
+        .replace("'", "\\'")
+        .replace("%", "\\%")
+    )
+
+
+def create_phone_visual_clip(
+    output_path: Path,
+    duration: float,
+    width: int,
+    height: int,
+    fps: int,
+    speaker_label: str,
+    caption_text: str,
+    job_dir: Path,
+    clip_index: int,
+    is_intro: bool,
+    requested_font_size: int,
+) -> None:
+    font_regular = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    font_bold = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+
+    caption, caption_size = choose_caption_layout(
+        text=caption_text,
+        is_hook=is_intro,
+        video_width=width,
+        requested_font_size=requested_font_size,
+    )
+    caption_path = job_dir / f"phone_caption_{clip_index}.txt"
+    caption_path.write_text(caption, encoding="utf-8")
+
+    speaker_path = job_dir / f"phone_speaker_{clip_index}.txt"
+    speaker_path.write_text(speaker_label, encoding="utf-8")
+
+    bg = "0x11131A" if is_intro else "0x171922"
+    top_label = "INCOMING CALL" if is_intro else "ON THE LINE"
+    top_label = _escape_drawtext(top_label)
+
+    filters = [
+        f"drawbox=x=0:y=0:w=iw:h=ih:color={bg}:t=fill",
+        "drawbox=x=70:y=120:w=iw-140:h=ih-240:color=white@0.035:t=fill",
+        "drawbox=x=110:y=190:w=iw-220:h=230:color=black@0.22:t=fill",
+        (
+            f"drawtext=fontfile={font_bold}:text='{top_label}':"
+            f"fontcolor=white@0.62:fontsize=34:x=(w-text_w)/2:y=235"
+        ),
+        (
+            f"drawtext=fontfile={font_bold}:textfile={speaker_path.as_posix()}:"
+            f"fontcolor=white:fontsize=58:x=(w-text_w)/2:y=300"
+        ),
+        (
+            f"drawtext=fontfile={font_regular}:textfile={caption_path.as_posix()}:"
+            f"fontcolor=white:fontsize={caption_size}:line_spacing={TEXT_LINE_SPACING}:"
+            f"borderw=3:bordercolor=black@0.75:box=1:boxcolor=black@0.20:"
+            f"boxborderw=30:x=(w-text_w)/2:y=h-text_h-300"
+        ),
+    ]
+
+    run([
+        "ffmpeg", "-y",
+        "-f", "lavfi",
+        "-i", f"color=c={bg}:s={width}x{height}:r={fps}",
+        "-t", f"{duration:.3f}",
+        "-vf", ",".join(filters),
+        "-an",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "22",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        str(output_path),
+    ])
+
+
+async def render_phone_call_static_job(
+    job_id: str, payload: PhoneCallRenderRequest
+) -> None:
+    job_dir = BASE_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    set_job(job_id, {"status": "downloading", "progress": 5, "renderer": payload.renderer})
+
+    try:
+        segments = sorted(payload.message.segments, key=lambda item: item.segment_index)
+        expected_indexes = list(range(len(segments)))
+        actual_indexes = [item.segment_index for item in segments]
+        if actual_indexes != expected_indexes:
+            raise ValueError(
+                "message.segments segment_index values must be consecutive and start at 0"
+            )
+
+        intro_audio_path = job_dir / "intro_voice.mp3"
+        segment_audio_paths = [
+            job_dir / f"message_voice_{segment.segment_index + 1}.mp3"
+            for segment in segments
+        ]
+
+        async with httpx.AsyncClient() as client:
+            await download_file(client, str(payload.intro.audio_url), intro_audio_path)
+            await asyncio.gather(*[
+                download_file(client, str(segment.audio_url), path)
+                for segment, path in zip(segments, segment_audio_paths)
+            ])
+
+        set_job(job_id, {"status": "rendering", "progress": 20, "renderer": payload.renderer})
+
+        intro_duration = probe_duration(intro_audio_path)
+        segment_durations = [probe_duration(path) for path in segment_audio_paths]
+
+        # Concatenate intro + four message segments with no CTA and no forced silence.
+        audio_inputs: list[str] = []
+        filter_parts: list[str] = []
+        labels: list[str] = []
+        all_audio_paths = [intro_audio_path, *segment_audio_paths]
+        for index, path in enumerate(all_audio_paths):
+            audio_inputs.extend(["-i", str(path)])
+            filter_parts.append(
+                f"[{index}:a]aresample=48000,"
+                f"aformat=sample_fmts=fltp:channel_layouts=stereo[a{index}]"
+            )
+            labels.append(f"[a{index}]")
+        filter_parts.append(
+            "".join(labels) + f"concat=n={len(labels)}:v=0:a=1[aout]"
+        )
+
+        combined_audio = job_dir / "combined_voice.wav"
+        run([
+            "ffmpeg", "-y", *audio_inputs,
+            "-filter_complex", ";".join(filter_parts),
+            "-map", "[aout]",
+            "-c:a", "pcm_s16le",
+            str(combined_audio),
+        ])
+        total_duration = probe_duration(combined_audio)
+
+        visual_clips: list[Path] = []
+        intro_clip = job_dir / "phone_visual_intro.mp4"
+        create_phone_visual_clip(
+            output_path=intro_clip,
+            duration=intro_duration,
+            width=payload.width,
+            height=payload.height,
+            fps=payload.fps,
+            speaker_label=payload.message.speaker_label or "You Have A Call",
+            caption_text=payload.intro.full_text,
+            job_dir=job_dir,
+            clip_index=0,
+            is_intro=True,
+            requested_font_size=payload.font_size,
+        )
+        visual_clips.append(intro_clip)
+
+        for index, (segment, duration) in enumerate(zip(segments, segment_durations), start=1):
+            target = job_dir / f"phone_visual_message_{index}.mp4"
+            create_phone_visual_clip(
+                output_path=target,
+                duration=duration,
+                width=payload.width,
+                height=payload.height,
+                fps=payload.fps,
+                speaker_label=payload.message.speaker_label or "Someone who cares",
+                caption_text=segment.text,
+                job_dir=job_dir,
+                clip_index=index,
+                is_intro=False,
+                requested_font_size=payload.font_size,
+            )
+            visual_clips.append(target)
+            progress = 25 + int((index / max(1, len(segments))) * 50)
+            set_job(job_id, {"status": "rendering", "progress": progress, "renderer": payload.renderer})
+
+        concat_path = job_dir / "phone_concat.txt"
+        concat_path.write_text(
+            "\n".join(f"file '{path.as_posix()}'" for path in visual_clips),
+            encoding="utf-8",
+        )
+        silent_video = job_dir / "silent.mp4"
+        run([
+            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+            "-i", str(concat_path), "-c", "copy", str(silent_video),
+        ])
+
+        final_video = job_dir / "final.mp4"
+        voice_filter = (
+            f"loudnorm=I={VOICE_TARGET_LUFS}:TP={VOICE_TRUE_PEAK}:LRA={VOICE_LRA}"
+            if ENABLE_AUDIO_NORMALIZATION else "anull"
+        )
+        run([
+            "ffmpeg", "-y",
+            "-i", str(silent_video),
+            "-i", str(combined_audio),
+            "-filter:a", voice_filter,
+            "-map", "0:v:0",
+            "-map", "1:a:0",
+            "-c:v", "copy",
+            "-c:a", "aac",
+            "-b:a", "192k",
+            "-shortest",
+            "-movflags", "+faststart",
+            str(final_video),
+        ])
+
+        thumbnail_path = job_dir / "thumbnail.jpg"
+        run([
+            "ffmpeg", "-y", "-ss", "0.2", "-i", str(final_video),
+            "-frames:v", "1", "-q:v", "3", str(thumbnail_path),
+        ])
+
+        set_job(job_id, {
+            "status": "succeeded",
+            "progress": 100,
+            "renderer": payload.renderer,
+            "duration": round(total_duration, 3),
+            "intro_audio_duration": round(intro_duration, 3),
+            "message_audio_durations": [round(value, 3) for value in segment_durations],
+            "message_segment_count": len(segments),
+            "download_url": f"/download/{job_id}",
+            "thumbnail_url": f"/thumbnail/{job_id}",
+        })
+
+    except Exception as exc:
+        set_job(job_id, {
+            "status": "failed",
+            "progress": 100,
+            "renderer": payload.renderer,
+            "error": str(exc),
+        })
+
+
 @app.get("/")
 def root():
-    return {"ok": True, "service": "ViralShrimpie FFmpeg Renderer", "version": "2.1.0"}
+    return {"ok": True, "service": "Channel Factory FFmpeg Renderer", "version": "3.0.0", "renderers": ["documentary_v1", "phone_call_static_v1"]}
 
 
 @app.get("/health")
@@ -702,10 +991,23 @@ def health():
 
 
 @app.post("/render")
-async def create_render(payload: RenderRequest, background_tasks: BackgroundTasks):
+async def create_render(payload: dict[str, Any], background_tasks: BackgroundTasks):
     job_id = str(uuid.uuid4())
     set_job(job_id, {"status": "queued", "progress": 0})
-    background_tasks.add_task(render_job, job_id, payload)
+    renderer_name = str(payload.get("renderer") or "documentary_v1")
+    try:
+        if renderer_name == "phone_call_static_v1":
+            validated_payload = PhoneCallRenderRequest.model_validate(payload)
+            task = render_phone_call_static_job
+        elif renderer_name in {"documentary_v1", "documentary_stock_v1"}:
+            validated_payload = DocumentaryRenderRequest.model_validate(payload)
+            task = render_documentary_job
+        else:
+            raise ValueError(f"Unknown renderer: {renderer_name}")
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    background_tasks.add_task(task, job_id, validated_payload)
     return {
         "job_id": job_id,
         "status": "queued",
