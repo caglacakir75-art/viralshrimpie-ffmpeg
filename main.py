@@ -1058,7 +1058,7 @@ async def render_phone_call_static_job(
         ambient_source = (
             "anoisesrc=color=pink:amplitude=0.10:r=48000,"
             "highpass=f=70,lowpass=f=850,"
-            "tremolo=f=0.075:d=0.62,"
+            "tremolo=f=0.12:d=0.62,"
             "aecho=0.8:0.75:90:0.12"
         )
         ambient_fade_out = max(0.0, total_duration - 1.4)
