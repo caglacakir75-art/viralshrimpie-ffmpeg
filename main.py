@@ -14,7 +14,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, HttpUrl
 
-app = FastAPI(title="Channel Factory FFmpeg Renderer", version="3.4.0")
+app = FastAPI(title="Channel Factory FFmpeg Renderer", version="3.4.1")
 
 BASE_DIR = Path(os.getenv("JOB_DIR", "/tmp/viralshrimpie_jobs"))
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -48,7 +48,7 @@ VOICE_LRA = 11
 DEFAULT_MUSIC_VOLUME = 0.08
 MUSIC_FADE_SECONDS = 1.0
 
-PHONE_AMBIENT_VOLUME = 0.085
+PHONE_AMBIENT_VOLUME = 0.115
 PHONE_SEGMENT_PAUSES_SECONDS = (0.45, 0.65, 0.75)
 
 ENABLE_CAPTION_SLIDE = False
@@ -132,7 +132,7 @@ class PhoneVisual(BaseModel):
     intro_scene: str = "incoming_phone_call"
     intro_action: str = "person_raises_phone_to_ear"
     message_scene: str = "phone_held_to_ear"
-    background_style: str = "peaceful_dark_coast"
+    background_style: str = "sunny_blurred_sea"
     subtitle_style: str = "centered_clean"
 
 
@@ -975,11 +975,11 @@ def create_phone_visual_clip(
     is_intro: bool,
     requested_font_size: int,
 ) -> None:
-    """Create an ethereal, softly blurred coastal-style background.
+    """Create a softly blurred sunny seaside background.
 
     The visual is generated procedurally, so the renderer does not depend on
-    external stock footage. It suggests sky, horizon and sea without making a
-    literal supernatural claim.
+    external stock footage. It suggests a calm bright sea view with a warm
+    horizon and soft blur.
     """
     font_regular = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
     font_bold = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
@@ -999,27 +999,28 @@ def create_phone_visual_clip(
     top_label = "INCOMING CALL" if is_intro else "ON THE LINE"
     top_label = _escape_drawtext(top_label)
 
-    # Dark, peaceful dusk coast: deep navy sky, muted teal sea and a restrained
-    # horizon glow. The result should feel calm and intimate, not ominous.
+    # Sunny blurred sea: pale blue sky, turquoise water and a warm horizon.
+    # The result stays calm and soft rather than looking like a sharp stock clip.
     background_filters = [
-        "drawbox=x=0:y=0:w=iw:h=ih*0.57:color=0x172433:t=fill",
-        "drawbox=x=0:y=ih*0.57:w=iw:h=ih*0.43:color=0x183B43:t=fill",
-        "drawbox=x=0:y=ih*0.50:w=iw:h=ih*0.13:color=0x6E8C8B@0.30:t=fill",
-        "drawbox=x=0:y=ih*0.72:w=iw:h=ih*0.28:color=0x0B2028@0.48:t=fill",
-        "gblur=sigma=48:steps=3",
-        "eq=brightness=-0.12:contrast=0.94:saturation=0.66",
-        "noise=alls=2.4:allf=t+u",
-        "vignette=PI/4.3",
+        "drawbox=x=0:y=0:w=iw:h=ih*0.52:color=0xC8ECFF:t=fill",
+        "drawbox=x=0:y=ih*0.52:w=iw:h=ih*0.48:color=0x79C8D9:t=fill",
+        "drawbox=x=0:y=ih*0.45:w=iw:h=ih*0.14:color=0xFFE7A8@0.58:t=fill",
+        "drawbox=x=0:y=ih*0.66:w=iw:h=ih*0.20:color=0xA1DDE7@0.36:t=fill",
+        "drawbox=x=iw*0.61:y=ih*0.13:w=iw*0.18:h=ih*0.18:color=0xFFF4CF@0.42:t=fill",
+        "gblur=sigma=40:steps=3",
+        "eq=brightness=0.06:contrast=0.90:saturation=0.92",
+        "noise=alls=2.0:allf=t+u",
+        "vignette=PI/7",
         (
-            f"zoompan=z='min(1.0+0.018*on/max(1,{max(1, int(duration * fps))}),1.018)':"
+            f"zoompan=z='min(1.0+0.014*on/max(1,{max(1, int(duration * fps))}),1.014)':"
             f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
             f"d=1:s={width}x{height}:fps={fps}"
         ),
     ]
 
     overlay_filters = [
-        "drawbox=x=55:y=95:w=iw-110:h=ih-190:color=black@0.10:t=fill",
-        "drawbox=x=95:y=165:w=iw-190:h=245:color=black@0.18:t=fill",
+        "drawbox=x=55:y=95:w=iw-110:h=ih-190:color=black@0.08:t=fill",
+        "drawbox=x=95:y=165:w=iw-190:h=245:color=black@0.15:t=fill",
         (
             f"drawtext=fontfile={font_bold}:text='{top_label}':"
             f"fontcolor=white@0.68:fontsize=32:x=(w-text_w)/2:y=215"
@@ -1039,7 +1040,7 @@ def create_phone_visual_clip(
     run([
         "ffmpeg", "-y",
         "-f", "lavfi",
-        "-i", f"color=c=0x172433:s={width}x{height}:r={fps}",
+        "-i", f"color=c=0xC8ECFF:s={width}x{height}:r={fps}",
         "-t", f"{duration:.3f}",
         "-vf", ",".join([*background_filters, *overlay_filters]),
         "-an",
@@ -1286,23 +1287,40 @@ async def render_phone_call_static_job(
             if ENABLE_AUDIO_NORMALIZATION else "anull"
         )
 
-        # Audible but restrained dark-ocean ambience. A low pink-noise bed,
-        # softened surf-like modulation and subtle echo keep the scene alive
-        # without competing with the voice.
-        ambient_source = (
-            "anoisesrc=color=pink:amplitude=0.16:r=48000,"
-            "highpass=f=55,lowpass=f=1200,"
-            "tremolo=f=0.10:d=0.48,"
-            "aecho=0.8:0.72:120:0.10"
+        # Brighter coastal ambience: audible surf, soft high-frequency air,
+        # and sparse bird-like chirps. It remains underneath the narration but
+        # is intentionally audible on phone speakers.
+        ambient_surf_source = (
+            "anoisesrc=color=brown:amplitude=0.20:r=48000,"
+            "highpass=f=70,lowpass=f=420"
         )
+        ambient_air_source = (
+            "anoisesrc=color=white:amplitude=0.018:r=48000,"
+            "highpass=f=2600,lowpass=f=9000"
+        )
+        ambient_bird_source = "sine=frequency=4300:sample_rate=48000"
         ambient_fade_out = max(0.0, total_duration - 1.4)
+        bird_volume_expr = (
+            "if(lt(mod(t,6.4),0.15),0.050,"
+            "if(lt(mod(t+1.9,8.1),0.12),0.040,"
+            "if(lt(mod(t+3.2,10.2),0.10),0.032,0)))"
+        )
         filter_complex = (
             f"[1:a]{voice_filter},aformat=channel_layouts=stereo[voice];"
             f"[2:a]volume={PHONE_AMBIENT_VOLUME},"
             f"afade=t=in:st=0:d=1.2,"
             f"afade=t=out:st={ambient_fade_out:.3f}:d=1.4,"
-            f"aformat=channel_layouts=stereo[ambient];"
-            f"[voice][ambient]amix=inputs=2:duration=first:"
+            f"aformat=channel_layouts=stereo[surf];"
+            f"[3:a]volume=0.030,"
+            f"afade=t=in:st=0:d=1.4,"
+            f"afade=t=out:st={ambient_fade_out:.3f}:d=1.4,"
+            f"aformat=channel_layouts=stereo[air];"
+            f"[4:a]volume='{bird_volume_expr}',"
+            f"lowpass=f=6200,highpass=f=2800,"
+            f"afade=t=in:st=0:d=1.0,"
+            f"afade=t=out:st={ambient_fade_out:.3f}:d=1.2,"
+            f"aformat=channel_layouts=stereo[birds];"
+            f"[voice][surf][air][birds]amix=inputs=4:duration=first:"
             f"dropout_transition=0:normalize=0[aout]"
         )
 
@@ -1311,7 +1329,11 @@ async def render_phone_call_static_job(
             "-i", str(silent_video),
             "-i", str(combined_audio),
             "-f", "lavfi", "-t", f"{total_duration:.3f}",
-            "-i", ambient_source,
+            "-i", ambient_surf_source,
+            "-f", "lavfi", "-t", f"{total_duration:.3f}",
+            "-i", ambient_air_source,
+            "-f", "lavfi", "-t", f"{total_duration:.3f}",
+            "-i", ambient_bird_source,
             "-filter_complex", filter_complex,
             "-map", "0:v:0",
             "-map", "[aout]",
@@ -1340,8 +1362,8 @@ async def render_phone_call_static_job(
             "message_segment_count": len(segments),
             "caption_chunk_count": rendered_caption_chunks,
             "caption_timing_mode": "elevenlabs_alignment_v1",
-            "visual_style": "procedural_dark_peaceful_coast_v2",
-            "ambient_style": "procedural_dark_ocean_v2",
+            "visual_style": "procedural_sunny_blurred_sea_v1",
+            "ambient_style": "procedural_sunny_ocean_birds_v1",
             "ambient_volume": PHONE_AMBIENT_VOLUME,
             "message_segment_pauses_seconds": [round(value, 3) for value in segment_pauses],
             "download_url": f"/download/{job_id}",
@@ -1359,7 +1381,7 @@ async def render_phone_call_static_job(
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "Channel Factory FFmpeg Renderer", "version": "3.4.0", "renderers": ["documentary_v1", "phone_call_static_v1"]}
+    return {"ok": True, "service": "Channel Factory FFmpeg Renderer", "version": "3.4.1", "renderers": ["documentary_v1", "phone_call_static_v1"]}
 
 
 @app.get("/health")
