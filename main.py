@@ -14,7 +14,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, HttpUrl
 
-app = FastAPI(title="Channel Factory FFmpeg Renderer", version="3.3.0")
+app = FastAPI(title="Channel Factory FFmpeg Renderer", version="3.3.1")
 
 BASE_DIR = Path(os.getenv("JOB_DIR", "/tmp/viralshrimpie_jobs"))
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -120,6 +120,7 @@ class PhoneMessage(BaseModel):
 
 class PhoneTimeline(BaseModel):
     intro_start_seconds: float = Field(default=0.0, ge=0.0)
+    post_intro_pause_seconds: float = Field(default=3.5, ge=0.0, le=10.0)
     message_start_seconds: float = Field(default=0.0, ge=0.0)
     estimated_total_duration_seconds: float = Field(default=0.0, ge=0.0)
 
@@ -1082,18 +1083,45 @@ async def render_phone_call_static_job(
         intro_duration = probe_duration(intro_audio_path)
         segment_durations = [probe_duration(path) for path in segment_audio_paths]
 
-        # Concatenate intro + four message segments with no CTA and no forced silence.
+        # Concatenate intro -> intentional post-intro silence -> message segments.
+        # The pause gives the viewer time to raise the phone after
+        # "Put it on your ear." before the emotional message begins.
+        post_intro_pause = float(payload.timeline.post_intro_pause_seconds or 0.0)
+
         audio_inputs: list[str] = []
         filter_parts: list[str] = []
         labels: list[str] = []
-        all_audio_paths = [intro_audio_path, *segment_audio_paths]
-        for index, path in enumerate(all_audio_paths):
+        input_index = 0
+
+        audio_inputs.extend(["-i", str(intro_audio_path)])
+        filter_parts.append(
+            f"[{input_index}:a]aresample=48000,"
+            f"aformat=sample_fmts=fltp:channel_layouts=stereo[a{input_index}]"
+        )
+        labels.append(f"[a{input_index}]")
+        input_index += 1
+
+        if post_intro_pause > 0:
+            audio_inputs.extend([
+                "-f", "lavfi", "-t", f"{post_intro_pause:.3f}",
+                "-i", "anullsrc=r=48000:cl=stereo",
+            ])
+            filter_parts.append(
+                f"[{input_index}:a]aresample=48000,"
+                f"aformat=sample_fmts=fltp:channel_layouts=stereo[a{input_index}]"
+            )
+            labels.append(f"[a{input_index}]")
+            input_index += 1
+
+        for path in segment_audio_paths:
             audio_inputs.extend(["-i", str(path)])
             filter_parts.append(
-                f"[{index}:a]aresample=48000,"
-                f"aformat=sample_fmts=fltp:channel_layouts=stereo[a{index}]"
+                f"[{input_index}:a]aresample=48000,"
+                f"aformat=sample_fmts=fltp:channel_layouts=stereo[a{input_index}]"
             )
-            labels.append(f"[a{index}]")
+            labels.append(f"[a{input_index}]")
+            input_index += 1
+
         filter_parts.append(
             "".join(labels) + f"concat=n={len(labels)}:v=0:a=1[aout]"
         )
@@ -1125,7 +1153,24 @@ async def render_phone_call_static_job(
         )
         visual_clips.append(intro_clip)
 
-        phone_clip_counter = 1
+        if post_intro_pause > 0:
+            pause_clip = job_dir / "phone_visual_post_intro_pause.mp4"
+            create_phone_visual_clip(
+                output_path=pause_clip,
+                duration=post_intro_pause,
+                width=payload.width,
+                height=payload.height,
+                fps=payload.fps,
+                speaker_label=payload.message.speaker_label or "You Have A Call",
+                caption_text="",
+                job_dir=job_dir,
+                clip_index=1,
+                is_intro=False,
+                requested_font_size=payload.font_size,
+            )
+            visual_clips.append(pause_clip)
+
+        phone_clip_counter = 2 if post_intro_pause > 0 else 1
         rendered_caption_chunks = 0
 
         for segment_position, (segment, duration) in enumerate(
@@ -1244,6 +1289,7 @@ async def render_phone_call_static_job(
             "renderer": payload.renderer,
             "duration": round(total_duration, 3),
             "intro_audio_duration": round(intro_duration, 3),
+            "post_intro_pause_seconds": round(post_intro_pause, 3),
             "message_audio_durations": [round(value, 3) for value in segment_durations],
             "message_segment_count": len(segments),
             "caption_chunk_count": rendered_caption_chunks,
@@ -1266,7 +1312,7 @@ async def render_phone_call_static_job(
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "Channel Factory FFmpeg Renderer", "version": "3.3.0", "renderers": ["documentary_v1", "phone_call_static_v1"]}
+    return {"ok": True, "service": "Channel Factory FFmpeg Renderer", "version": "3.3.1", "renderers": ["documentary_v1", "phone_call_static_v1"]}
 
 
 @app.get("/health")
