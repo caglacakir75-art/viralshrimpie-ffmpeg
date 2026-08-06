@@ -14,7 +14,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, HttpUrl
 
-app = FastAPI(title="Channel Factory FFmpeg Renderer", version="3.2.0")
+app = FastAPI(title="Channel Factory FFmpeg Renderer", version="3.3.0")
 
 BASE_DIR = Path(os.getenv("JOB_DIR", "/tmp/viralshrimpie_jobs"))
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -94,6 +94,12 @@ class PhoneIntro(BaseModel):
     duration_seconds: float = Field(default=0.0, ge=0.0, le=30.0)
 
 
+class PhoneAlignment(BaseModel):
+    characters: List[str]
+    character_start_times_seconds: List[float]
+    character_end_times_seconds: List[float]
+
+
 class PhoneMessageSegment(BaseModel):
     segment_index: int = Field(ge=0, le=20)
     segment_number: int = Field(ge=1, le=20)
@@ -101,6 +107,7 @@ class PhoneMessageSegment(BaseModel):
     text: str = Field(min_length=1, max_length=1500)
     audio_url: HttpUrl
     duration_seconds: float = Field(default=0.0, ge=0.0, le=120.0)
+    alignment: PhoneAlignment | None = None
 
 
 class PhoneMessage(BaseModel):
@@ -816,6 +823,141 @@ def split_caption_chunks(text: str, max_words: int = 8) -> list[str]:
     return [chunk for chunk in chunks if chunk]
 
 
+
+def normalize_speaker_label(value: str) -> str:
+    """Return a short caller label that is safe for one-line display."""
+    raw = " ".join(str(value or "").split()).strip()
+    if not raw:
+        return "Someone Who Cares"
+
+    lowered = raw.lower()
+    if any(token in lowered for token in ("future self", "older self", "healed self")):
+        return "Your Future Self"
+    if any(token in lowered for token in ("younger self", "childhood self", "inner child")):
+        return "Your Younger Self"
+    if any(token in lowered for token in ("mother", "mom", "maternal")):
+        return "Mom"
+    if any(token in lowered for token in ("father", "dad", "paternal")):
+        return "Dad"
+    if "best friend" in lowered or "close friend" in lowered:
+        return "Your Best Friend"
+    if any(token in lowered for token in ("grandmother", "grandma")):
+        return "Grandma"
+    if any(token in lowered for token in ("grandfather", "grandpa")):
+        return "Grandpa"
+
+    # Prefer the first concise phrase when the model returned a description.
+    candidate = re.split(r"[,;–—|]", raw, maxsplit=1)[0].strip()
+    if len(candidate) <= 24:
+        return candidate
+
+    words = candidate.split()
+    kept: list[str] = []
+    for word in words:
+        proposed = " ".join([*kept, word])
+        if len(proposed) > 24:
+            break
+        kept.append(word)
+    return " ".join(kept).strip() or "Someone Who Cares"
+
+
+def aligned_caption_timeline(
+    alignment: PhoneAlignment | None,
+    fallback_text: str,
+    segment_duration: float,
+    max_words: int = 7,
+) -> list[tuple[str, float]]:
+    """Build short caption clips from ElevenLabs character timestamps.
+
+    Returns (caption_text, clip_duration) entries whose durations add up to the
+    complete audio segment. Empty text entries intentionally preserve pauses.
+    """
+    if alignment is None:
+        chunks = split_caption_chunks(fallback_text, max_words=max_words) or [fallback_text]
+        return list(zip(chunks, weighted_durations(chunks, segment_duration)))
+
+    chars = alignment.characters
+    starts = alignment.character_start_times_seconds
+    ends = alignment.character_end_times_seconds
+    if not chars or len(chars) != len(starts) or len(chars) != len(ends):
+        chunks = split_caption_chunks(fallback_text, max_words=max_words) or [fallback_text]
+        return list(zip(chunks, weighted_durations(chunks, segment_duration)))
+
+    # Convert character alignment into timed words.
+    words: list[dict[str, Any]] = []
+    current_chars: list[str] = []
+    word_start: float | None = None
+    word_end: float | None = None
+
+    def flush_word() -> None:
+        nonlocal current_chars, word_start, word_end
+        text = "".join(current_chars).strip()
+        if text and word_start is not None and word_end is not None:
+            words.append({"text": text, "start": word_start, "end": word_end})
+        current_chars = []
+        word_start = None
+        word_end = None
+
+    for char, start, end_time in zip(chars, starts, ends):
+        if str(char).isspace():
+            flush_word()
+            continue
+        if word_start is None:
+            word_start = float(start)
+        current_chars.append(str(char))
+        word_end = float(end_time)
+    flush_word()
+
+    if not words:
+        chunks = split_caption_chunks(fallback_text, max_words=max_words) or [fallback_text]
+        return list(zip(chunks, weighted_durations(chunks, segment_duration)))
+
+    groups: list[dict[str, Any]] = []
+    current: list[dict[str, Any]] = []
+    for word in words:
+        current.append(word)
+        ends_phrase = bool(re.search(r"[.!?…,:;]$", word["text"]))
+        if len(current) >= max_words or (ends_phrase and len(current) >= 2):
+            groups.append({
+                "text": " ".join(item["text"] for item in current),
+                "start": current[0]["start"],
+                "end": current[-1]["end"],
+            })
+            current = []
+    if current:
+        groups.append({
+            "text": " ".join(item["text"] for item in current),
+            "start": current[0]["start"],
+            "end": current[-1]["end"],
+        })
+
+    timeline: list[tuple[str, float]] = []
+    cursor = 0.0
+    for index, group in enumerate(groups):
+        start = max(cursor, float(group["start"]))
+        if start - cursor > 0.06:
+            timeline.append(("", start - cursor))
+        next_start = (
+            float(groups[index + 1]["start"])
+            if index + 1 < len(groups)
+            else segment_duration
+        )
+        end = max(float(group["end"]), next_start)
+        end = min(max(end, start + 0.08), segment_duration)
+        timeline.append((str(group["text"]).strip(), end - start))
+        cursor = end
+
+    if cursor < segment_duration - 0.03:
+        timeline.append(("", segment_duration - cursor))
+
+    # Avoid zero-length clips and correct small floating-point drift.
+    timeline = [(text, duration) for text, duration in timeline if duration > 0.03]
+    total = sum(duration for _, duration in timeline)
+    if timeline and abs(total - segment_duration) > 0.01:
+        text, duration = timeline[-1]
+        timeline[-1] = (text, max(0.04, duration + segment_duration - total))
+    return timeline
+
 def create_phone_visual_clip(
     output_path: Path,
     duration: float,
@@ -848,7 +990,7 @@ def create_phone_visual_clip(
     caption_path.write_text(caption, encoding="utf-8")
 
     speaker_path = job_dir / f"phone_speaker_{clip_index}.txt"
-    speaker_path.write_text(speaker_label, encoding="utf-8")
+    speaker_path.write_text(normalize_speaker_label(speaker_label), encoding="utf-8")
 
     top_label = "INCOMING CALL" if is_intro else "ON THE LINE"
     top_label = _escape_drawtext(top_label)
@@ -990,14 +1132,15 @@ async def render_phone_call_static_job(
             zip(segments, segment_durations),
             start=1,
         ):
-            caption_chunks = split_caption_chunks(segment.text, max_words=8)
-            if not caption_chunks:
-                caption_chunks = [segment.text]
-
-            chunk_durations = weighted_durations(caption_chunks, duration)
+            caption_timeline = aligned_caption_timeline(
+                alignment=segment.alignment,
+                fallback_text=segment.text,
+                segment_duration=duration,
+                max_words=7,
+            )
 
             for chunk_position, (caption_chunk, chunk_duration) in enumerate(
-                zip(caption_chunks, chunk_durations),
+                caption_timeline,
                 start=1,
             ):
                 target = job_dir / (
@@ -1104,7 +1247,7 @@ async def render_phone_call_static_job(
             "message_audio_durations": [round(value, 3) for value in segment_durations],
             "message_segment_count": len(segments),
             "caption_chunk_count": rendered_caption_chunks,
-            "caption_timing_mode": "weighted_phrase_v1",
+            "caption_timing_mode": "elevenlabs_alignment_v1",
             "visual_style": "procedural_blurred_coast_v1",
             "ambient_style": "procedural_soft_ocean_v1",
             "ambient_volume": 0.032,
@@ -1123,7 +1266,7 @@ async def render_phone_call_static_job(
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "Channel Factory FFmpeg Renderer", "version": "3.2.0", "renderers": ["documentary_v1", "phone_call_static_v1"]}
+    return {"ok": True, "service": "Channel Factory FFmpeg Renderer", "version": "3.3.0", "renderers": ["documentary_v1", "phone_call_static_v1"]}
 
 
 @app.get("/health")
