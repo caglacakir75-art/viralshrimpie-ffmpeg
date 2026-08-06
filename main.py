@@ -14,7 +14,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, HttpUrl
 
-app = FastAPI(title="Channel Factory FFmpeg Renderer", version="3.3.1")
+app = FastAPI(title="Channel Factory FFmpeg Renderer", version="3.4.0")
 
 BASE_DIR = Path(os.getenv("JOB_DIR", "/tmp/viralshrimpie_jobs"))
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -47,6 +47,9 @@ VOICE_LRA = 11
 
 DEFAULT_MUSIC_VOLUME = 0.08
 MUSIC_FADE_SECONDS = 1.0
+
+PHONE_AMBIENT_VOLUME = 0.085
+PHONE_SEGMENT_PAUSES_SECONDS = (0.45, 0.65, 0.75)
 
 ENABLE_CAPTION_SLIDE = False
 CAPTION_SLIDE_SECONDS = 0.22
@@ -129,7 +132,7 @@ class PhoneVisual(BaseModel):
     intro_scene: str = "incoming_phone_call"
     intro_action: str = "person_raises_phone_to_ear"
     message_scene: str = "phone_held_to_ear"
-    background_style: str = "cinematic_emotional_minimal"
+    background_style: str = "peaceful_dark_coast"
     subtitle_style: str = "centered_clean"
 
 
@@ -996,17 +999,17 @@ def create_phone_visual_clip(
     top_label = "INCOMING CALL" if is_intro else "ON THE LINE"
     top_label = _escape_drawtext(top_label)
 
-    # Build a soft sky / horizon / sea composition, then blur and vignette it.
-    # The subtle zoom creates life without looking like a stock-video loop.
+    # Dark, peaceful dusk coast: deep navy sky, muted teal sea and a restrained
+    # horizon glow. The result should feel calm and intimate, not ominous.
     background_filters = [
-        "drawbox=x=0:y=0:w=iw:h=ih*0.55:color=0x9FB7C8:t=fill",
-        "drawbox=x=0:y=ih*0.55:w=iw:h=ih*0.45:color=0x49677A:t=fill",
-        "drawbox=x=0:y=ih*0.49:w=iw:h=ih*0.12:color=0xD8C6A2@0.48:t=fill",
-        "drawbox=x=0:y=ih*0.70:w=iw:h=ih*0.30:color=0x243D4A@0.26:t=fill",
-        "gblur=sigma=42:steps=3",
-        "eq=brightness=-0.06:contrast=0.92:saturation=0.78",
-        "noise=alls=3:allf=t+u",
-        "vignette=PI/5",
+        "drawbox=x=0:y=0:w=iw:h=ih*0.57:color=0x172433:t=fill",
+        "drawbox=x=0:y=ih*0.57:w=iw:h=ih*0.43:color=0x183B43:t=fill",
+        "drawbox=x=0:y=ih*0.50:w=iw:h=ih*0.13:color=0x6E8C8B@0.30:t=fill",
+        "drawbox=x=0:y=ih*0.72:w=iw:h=ih*0.28:color=0x0B2028@0.48:t=fill",
+        "gblur=sigma=48:steps=3",
+        "eq=brightness=-0.12:contrast=0.94:saturation=0.66",
+        "noise=alls=2.4:allf=t+u",
+        "vignette=PI/4.3",
         (
             f"zoompan=z='min(1.0+0.018*on/max(1,{max(1, int(duration * fps))}),1.018)':"
             f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
@@ -1036,7 +1039,7 @@ def create_phone_visual_clip(
     run([
         "ffmpeg", "-y",
         "-f", "lavfi",
-        "-i", f"color=c=0x9FB7C8:s={width}x{height}:r={fps}",
+        "-i", f"color=c=0x172433:s={width}x{height}:r={fps}",
         "-t", f"{duration:.3f}",
         "-vf", ",".join([*background_filters, *overlay_filters]),
         "-an",
@@ -1113,7 +1116,13 @@ async def render_phone_call_static_job(
             labels.append(f"[a{input_index}]")
             input_index += 1
 
-        for path in segment_audio_paths:
+        segment_pauses = [
+            PHONE_SEGMENT_PAUSES_SECONDS[index]
+            if index < len(PHONE_SEGMENT_PAUSES_SECONDS) else 0.0
+            for index in range(max(0, len(segment_audio_paths) - 1))
+        ]
+
+        for segment_index, path in enumerate(segment_audio_paths):
             audio_inputs.extend(["-i", str(path)])
             filter_parts.append(
                 f"[{input_index}:a]aresample=48000,"
@@ -1121,6 +1130,19 @@ async def render_phone_call_static_job(
             )
             labels.append(f"[a{input_index}]")
             input_index += 1
+
+            if segment_index < len(segment_pauses) and segment_pauses[segment_index] > 0:
+                pause_seconds = segment_pauses[segment_index]
+                audio_inputs.extend([
+                    "-f", "lavfi", "-t", f"{pause_seconds:.3f}",
+                    "-i", "anullsrc=r=48000:cl=stereo",
+                ])
+                filter_parts.append(
+                    f"[{input_index}:a]aresample=48000,"
+                    f"aformat=sample_fmts=fltp:channel_layouts=stereo[a{input_index}]"
+                )
+                labels.append(f"[a{input_index}]")
+                input_index += 1
 
         filter_parts.append(
             "".join(labels) + f"concat=n={len(labels)}:v=0:a=1[aout]"
@@ -1211,6 +1233,30 @@ async def render_phone_call_static_job(
                 phone_clip_counter += 1
                 rendered_caption_chunks += 1
 
+            if segment_position <= len(segment_pauses):
+                breath_pause = segment_pauses[segment_position - 1]
+                if breath_pause > 0:
+                    pause_target = job_dir / (
+                        f"phone_visual_message_{segment_position}_breath_pause.mp4"
+                    )
+                    create_phone_visual_clip(
+                        output_path=pause_target,
+                        duration=breath_pause,
+                        width=payload.width,
+                        height=payload.height,
+                        fps=payload.fps,
+                        speaker_label=(
+                            payload.message.speaker_label or "Someone who cares"
+                        ),
+                        caption_text="",
+                        job_dir=job_dir,
+                        clip_index=phone_clip_counter,
+                        is_intro=False,
+                        requested_font_size=payload.font_size,
+                    )
+                    visual_clips.append(pause_target)
+                    phone_clip_counter += 1
+
             progress = 25 + int(
                 (segment_position / max(1, len(segments))) * 50
             )
@@ -1240,19 +1286,19 @@ async def render_phone_call_static_job(
             if ENABLE_AUDIO_NORMALIZATION else "anull"
         )
 
-        # Procedural ambient layer: very soft, filtered pink noise with a slow
-        # swell. It behaves like distant ocean air without requiring an
-        # external audio asset and remains far below the narration.
+        # Audible but restrained dark-ocean ambience. A low pink-noise bed,
+        # softened surf-like modulation and subtle echo keep the scene alive
+        # without competing with the voice.
         ambient_source = (
-            "anoisesrc=color=pink:amplitude=0.10:r=48000,"
-            "highpass=f=70,lowpass=f=850,"
-            "tremolo=f=0.12:d=0.62,"
-            "aecho=0.8:0.75:90:0.12"
+            "anoisesrc=color=pink:amplitude=0.16:r=48000,"
+            "highpass=f=55,lowpass=f=1200,"
+            "tremolo=f=0.10:d=0.48,"
+            "aecho=0.8:0.72:120:0.10"
         )
         ambient_fade_out = max(0.0, total_duration - 1.4)
         filter_complex = (
             f"[1:a]{voice_filter},aformat=channel_layouts=stereo[voice];"
-            f"[2:a]volume=0.032,"
+            f"[2:a]volume={PHONE_AMBIENT_VOLUME},"
             f"afade=t=in:st=0:d=1.2,"
             f"afade=t=out:st={ambient_fade_out:.3f}:d=1.4,"
             f"aformat=channel_layouts=stereo[ambient];"
@@ -1294,9 +1340,10 @@ async def render_phone_call_static_job(
             "message_segment_count": len(segments),
             "caption_chunk_count": rendered_caption_chunks,
             "caption_timing_mode": "elevenlabs_alignment_v1",
-            "visual_style": "procedural_blurred_coast_v1",
-            "ambient_style": "procedural_soft_ocean_v1",
-            "ambient_volume": 0.032,
+            "visual_style": "procedural_dark_peaceful_coast_v2",
+            "ambient_style": "procedural_dark_ocean_v2",
+            "ambient_volume": PHONE_AMBIENT_VOLUME,
+            "message_segment_pauses_seconds": [round(value, 3) for value in segment_pauses],
             "download_url": f"/download/{job_id}",
             "thumbnail_url": f"/thumbnail/{job_id}",
         })
@@ -1312,7 +1359,7 @@ async def render_phone_call_static_job(
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "Channel Factory FFmpeg Renderer", "version": "3.3.1", "renderers": ["documentary_v1", "phone_call_static_v1"]}
+    return {"ok": True, "service": "Channel Factory FFmpeg Renderer", "version": "3.4.0", "renderers": ["documentary_v1", "phone_call_static_v1"]}
 
 
 @app.get("/health")
