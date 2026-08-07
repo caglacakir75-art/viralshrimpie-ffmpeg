@@ -7,6 +7,7 @@ import subprocess
 import textwrap
 import uuid
 from pathlib import Path
+from threading import Thread
 from typing import Any, List, Literal
 
 import httpx
@@ -14,7 +15,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, HttpUrl
 
-app = FastAPI(title="Channel Factory FFmpeg Renderer", version="3.4.1")
+app = FastAPI(title="Channel Factory FFmpeg Renderer", version="3.4.2")
 
 BASE_DIR = Path(os.getenv("JOB_DIR", "/tmp/viralshrimpie_jobs"))
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1379,9 +1380,27 @@ async def render_phone_call_static_job(
         })
 
 
+def run_async_job_in_thread(task, job_id: str, validated_payload) -> None:
+    """Run one async renderer in its own thread/event loop.
+
+    This keeps blocking FFmpeg/subprocess work away from Uvicorn's main
+    event loop so /status remains responsive while a render is in progress.
+    """
+    try:
+        asyncio.run(task(job_id, validated_payload))
+    except Exception as exc:
+        # Renderer functions already persist their own failures, but keep a
+        # final safety net here for errors that happen before their try block.
+        set_job(job_id, {
+            "status": "failed",
+            "progress": 100,
+            "error": str(exc),
+        })
+
+
 @app.get("/")
 def root():
-    return {"ok": True, "service": "Channel Factory FFmpeg Renderer", "version": "3.4.1", "renderers": ["documentary_v1", "phone_call_static_v1"]}
+    return {"ok": True, "service": "Channel Factory FFmpeg Renderer", "version": "3.4.2", "renderers": ["documentary_v1", "phone_call_static_v1"]}
 
 
 @app.get("/health")
@@ -1390,7 +1409,7 @@ def health():
 
 
 @app.post("/render")
-async def create_render(payload: dict[str, Any], background_tasks: BackgroundTasks):
+async def create_render(payload: dict[str, Any]):
     job_id = str(uuid.uuid4())
     set_job(job_id, {"status": "queued", "progress": 0})
     renderer_name = str(payload.get("renderer") or "documentary_v1")
@@ -1406,7 +1425,12 @@ async def create_render(payload: dict[str, Any], background_tasks: BackgroundTas
     except Exception as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
-    background_tasks.add_task(task, job_id, validated_payload)
+    Thread(
+        target=run_async_job_in_thread,
+        args=(task, job_id, validated_payload),
+        daemon=True,
+        name=f"render-{job_id[:8]}",
+    ).start()
     return {
         "job_id": job_id,
         "status": "queued",
