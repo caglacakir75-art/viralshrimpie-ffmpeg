@@ -15,7 +15,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, HttpUrl
 
-app = FastAPI(title="Channel Factory FFmpeg Renderer", version="3.5.0")
+app = FastAPI(title="Channel Factory FFmpeg Renderer", version="3.6.0")
 
 BASE_DIR = Path(os.getenv("JOB_DIR", "/tmp/viralshrimpie_jobs"))
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -51,6 +51,14 @@ MUSIC_FADE_SECONDS = 1.0
 
 PHONE_AMBIENT_VOLUME = 0.115
 PHONE_SEGMENT_PAUSES_SECONDS = (0.45, 0.65, 0.75)
+
+# YouHaveaCall sonic branding. The ring sits under the spoken intro.
+# After the final intro words, a tiny connect chirp + pickup click + short
+# human-feeling silence replaces the old 3.5 second dead-air pause.
+PHONE_RING_VOLUME = 0.105
+PHONE_CONNECT_TONE_SECONDS = 0.22
+PHONE_PICKUP_CLICK_SECONDS = 0.08
+PHONE_POST_PICKUP_GAP_SECONDS = 0.55
 
 ENABLE_CAPTION_SLIDE = False
 CAPTION_SLIDE_SECONDS = 0.22
@@ -124,7 +132,7 @@ class PhoneMessage(BaseModel):
 
 class PhoneTimeline(BaseModel):
     intro_start_seconds: float = Field(default=0.0, ge=0.0)
-    post_intro_pause_seconds: float = Field(default=3.5, ge=0.0, le=10.0)
+    post_intro_pause_seconds: float = Field(default=0.85, ge=0.0, le=10.0)
     message_start_seconds: float = Field(default=0.0, ge=0.0)
     estimated_total_duration_seconds: float = Field(default=0.0, ge=0.0)
 
@@ -1119,6 +1127,77 @@ def create_phone_background_clip(
     ])
 
 
+def create_phone_intro_with_ring(
+    intro_audio_path: Path,
+    output_path: Path,
+    duration: float,
+) -> None:
+    """Mix the fixed YouHaveaCall ring underneath the spoken intro.
+
+    The ring is deliberately recognizable but quiet enough that the words
+    remain clear on phone speakers. It pulses rather than playing constantly.
+    """
+    ring_gate = "if(lt(mod(t,1.45),0.62),1,0)"
+    filter_complex = (
+        f"[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[intro];"
+        f"[1:a][2:a]amix=inputs=2:normalize=0,volume={PHONE_RING_VOLUME},"
+        f"volume='{ring_gate}':eval=frame,"
+        f"afade=t=in:st=0:d=0.06,"
+        f"afade=t=out:st={max(0.0, duration - 0.12):.3f}:d=0.12,"
+        f"aformat=channel_layouts=stereo[ring];"
+        f"[intro][ring]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]"
+    )
+
+    run([
+        "ffmpeg", "-y",
+        "-i", str(intro_audio_path),
+        "-f", "lavfi", "-t", f"{duration:.3f}",
+        "-i", "sine=frequency=440:sample_rate=48000",
+        "-f", "lavfi", "-t", f"{duration:.3f}",
+        "-i", "sine=frequency=480:sample_rate=48000",
+        "-filter_complex", filter_complex,
+        "-map", "[aout]",
+        "-c:a", "pcm_s16le",
+        str(output_path),
+    ])
+
+
+def create_phone_connect_tone(output_path: Path) -> None:
+    """Create a very short clean connection chirp after the intro."""
+    run([
+        "ffmpeg", "-y",
+        "-f", "lavfi",
+        "-i", "sine=frequency=980:sample_rate=48000",
+        "-t", f"{PHONE_CONNECT_TONE_SECONDS:.3f}",
+        "-af", (
+            "volume=0.16,"
+            "afade=t=in:st=0:d=0.025,"
+            f"afade=t=out:st={max(0.0, PHONE_CONNECT_TONE_SECONDS - 0.07):.3f}:d=0.07,"
+            "aformat=channel_layouts=stereo"
+        ),
+        "-c:a", "pcm_s16le",
+        str(output_path),
+    ])
+
+
+def create_phone_pickup_click(output_path: Path) -> None:
+    """Create a tiny handset/pickup click, intentionally subtle."""
+    run([
+        "ffmpeg", "-y",
+        "-f", "lavfi",
+        "-i", "anoisesrc=color=white:amplitude=0.55:r=48000",
+        "-t", f"{PHONE_PICKUP_CLICK_SECONDS:.3f}",
+        "-af", (
+            "highpass=f=900,lowpass=f=5200,"
+            "volume=0.10,"
+            f"afade=t=out:st={max(0.0, PHONE_PICKUP_CLICK_SECONDS - 0.045):.3f}:d=0.045,"
+            "aformat=channel_layouts=stereo"
+        ),
+        "-c:a", "pcm_s16le",
+        str(output_path),
+    ])
+
+
 def write_phone_ass_subtitles(
     output_path: Path,
     *,
@@ -1258,9 +1337,29 @@ async def render_phone_call_static_job(
             probe_duration(path)
             for path in segment_audio_paths
         ]
-        post_intro_pause = float(
+
+        # The old long post-intro pause is intentionally replaced by sonic
+        # call branding: connect tone -> pickup click -> short human pause.
+        requested_post_intro_pause = float(
             payload.timeline.post_intro_pause_seconds or 0.0
         )
+        post_intro_pause = (
+            PHONE_CONNECT_TONE_SECONDS
+            + PHONE_PICKUP_CLICK_SECONDS
+            + PHONE_POST_PICKUP_GAP_SECONDS
+        )
+
+        intro_with_ring_path = job_dir / "intro_with_ring.wav"
+        connect_tone_path = job_dir / "phone_connect.wav"
+        pickup_click_path = job_dir / "phone_pickup.wav"
+
+        create_phone_intro_with_ring(
+            intro_audio_path=intro_audio_path,
+            output_path=intro_with_ring_path,
+            duration=intro_duration,
+        )
+        create_phone_connect_tone(connect_tone_path)
+        create_phone_pickup_click(pickup_click_path)
 
         segment_pauses = [
             PHONE_SEGMENT_PAUSES_SECONDS[index]
@@ -1275,7 +1374,8 @@ async def render_phone_call_static_job(
         labels: list[str] = []
         input_index = 0
 
-        audio_inputs.extend(["-i", str(intro_audio_path)])
+        # Intro voice already contains the ringing layer.
+        audio_inputs.extend(["-i", str(intro_with_ring_path)])
         filter_parts.append(
             f"[{input_index}:a]aresample=48000,"
             f"aformat=sample_fmts=fltp:channel_layouts=stereo[a{input_index}]"
@@ -1283,10 +1383,29 @@ async def render_phone_call_static_job(
         labels.append(f"[a{input_index}]")
         input_index += 1
 
-        if post_intro_pause > 0:
+        # Tiny connection chirp immediately after “Put it on your ear.”
+        audio_inputs.extend(["-i", str(connect_tone_path)])
+        filter_parts.append(
+            f"[{input_index}:a]aresample=48000,"
+            f"aformat=sample_fmts=fltp:channel_layouts=stereo[a{input_index}]"
+        )
+        labels.append(f"[a{input_index}]")
+        input_index += 1
+
+        # Subtle handset pickup/click.
+        audio_inputs.extend(["-i", str(pickup_click_path)])
+        filter_parts.append(
+            f"[{input_index}:a]aresample=48000,"
+            f"aformat=sample_fmts=fltp:channel_layouts=stereo[a{input_index}]"
+        )
+        labels.append(f"[a{input_index}]")
+        input_index += 1
+
+        # A short pause is enough to make the caller entrance feel human.
+        if PHONE_POST_PICKUP_GAP_SECONDS > 0:
             audio_inputs.extend([
                 "-f", "lavfi",
-                "-t", f"{post_intro_pause:.3f}",
+                "-t", f"{PHONE_POST_PICKUP_GAP_SECONDS:.3f}",
                 "-i", "anullsrc=r=48000:cl=stereo",
             ])
             filter_parts.append(
@@ -1473,7 +1592,13 @@ async def render_phone_call_static_job(
             "renderer": payload.renderer,
             "duration": round(total_duration, 3),
             "intro_audio_duration": round(intro_duration, 3),
+            "requested_post_intro_pause_seconds": round(requested_post_intro_pause, 3),
             "post_intro_pause_seconds": round(post_intro_pause, 3),
+            "phone_ring_under_intro": True,
+            "phone_ring_volume": PHONE_RING_VOLUME,
+            "phone_connect_tone_seconds": PHONE_CONNECT_TONE_SECONDS,
+            "phone_pickup_click_seconds": PHONE_PICKUP_CLICK_SECONDS,
+            "phone_post_pickup_gap_seconds": PHONE_POST_PICKUP_GAP_SECONDS,
             "message_audio_durations": [
                 round(value, 3)
                 for value in segment_durations
@@ -1482,7 +1607,7 @@ async def render_phone_call_static_job(
             "caption_chunk_count": rendered_caption_chunks,
             "caption_timing_mode": "elevenlabs_alignment_ass_v2",
             "visual_style": "procedural_sunny_blurred_sea_v2",
-            "render_strategy": "single_background_single_ass_pass_v1",
+            "render_strategy": "single_background_single_ass_pass_v2_sonic_intro",
             "ambient_style": "procedural_sunny_ocean_birds_v1",
             "ambient_volume": PHONE_AMBIENT_VOLUME,
             "message_segment_pauses_seconds": [
@@ -1521,7 +1646,7 @@ def run_async_job_in_thread(task, job_id: str, validated_payload) -> None:
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "Channel Factory FFmpeg Renderer", "version": "3.5.0", "renderers": ["documentary_v1", "phone_call_static_v1"]}
+    return {"ok": True, "service": "Channel Factory FFmpeg Renderer", "version": "3.6.0", "renderers": ["documentary_v1", "phone_call_static_v1"]}
 
 
 @app.get("/health")
