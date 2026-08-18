@@ -15,7 +15,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, HttpUrl
 
-app = FastAPI(title="Channel Factory FFmpeg Renderer", version="3.4.2")
+app = FastAPI(title="Channel Factory FFmpeg Renderer", version="3.5.0")
 
 BASE_DIR = Path(os.getenv("JOB_DIR", "/tmp/viralshrimpie_jobs"))
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1054,15 +1054,176 @@ def create_phone_visual_clip(
     ])
 
 
+def _ass_timestamp(seconds: float) -> str:
+    seconds = max(0.0, float(seconds))
+    centiseconds = int(round(seconds * 100))
+    hours, remainder = divmod(centiseconds, 360000)
+    minutes, remainder = divmod(remainder, 6000)
+    secs, centis = divmod(remainder, 100)
+    return f"{hours}:{minutes:02d}:{secs:02d}.{centis:02d}"
+
+
+def _ass_escape(text: str) -> str:
+    value = str(text or "")
+    value = value.replace("\\", r"\\")
+    value = value.replace("{", r"\{").replace("}", r"\}")
+    value = value.replace("\r\n", "\n").replace("\r", "\n")
+    value = value.replace("\n", r"\N")
+    return value
+
+
+def create_phone_background_clip(
+    output_path: Path,
+    duration: float,
+    width: int,
+    height: int,
+    fps: int,
+) -> None:
+    """Render one full-length sunny, blurred sea background.
+
+    Unlike the previous phone renderer, this does not create a new MP4 for
+    every subtitle chunk. The complete visual bed is encoded once.
+    """
+    frame_count = max(1, int(duration * fps))
+    filters = [
+        "drawbox=x=0:y=0:w=iw:h=ih*0.52:color=0xC8ECFF:t=fill",
+        "drawbox=x=0:y=ih*0.52:w=iw:h=ih*0.48:color=0x79C8D9:t=fill",
+        "drawbox=x=0:y=ih*0.45:w=iw:h=ih*0.14:color=0xFFE7A8@0.58:t=fill",
+        "drawbox=x=0:y=ih*0.66:w=iw:h=ih*0.20:color=0xA1DDE7@0.36:t=fill",
+        "drawbox=x=iw*0.61:y=ih*0.13:w=iw*0.18:h=ih*0.18:color=0xFFF4CF@0.42:t=fill",
+        "gblur=sigma=40:steps=3",
+        "eq=brightness=0.06:contrast=0.90:saturation=0.92",
+        "noise=alls=2.0:allf=t+u",
+        "vignette=PI/7",
+        (
+            f"zoompan=z='min(1.0+0.014*on/max(1,{frame_count}),1.014)':"
+            f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
+            f"d=1:s={width}x{height}:fps={fps}"
+        ),
+    ]
+
+    run([
+        "ffmpeg", "-y",
+        "-f", "lavfi",
+        "-i", f"color=c=0xC8ECFF:s={width}x{height}:r={fps}",
+        "-t", f"{duration:.3f}",
+        "-vf", ",".join(filters),
+        "-an",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "22",
+        "-threads", "1",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        str(output_path),
+    ])
+
+
+def write_phone_ass_subtitles(
+    output_path: Path,
+    *,
+    width: int,
+    height: int,
+    intro_duration: float,
+    post_intro_pause: float,
+    speaker_label: str,
+    intro_text: str,
+    segments: list[PhoneMessageSegment],
+    segment_durations: list[float],
+    segment_pauses: list[float],
+    total_duration: float,
+    requested_font_size: int,
+) -> int:
+    """Create one ASS track for the complete phone-call video.
+
+    ElevenLabs character alignment is converted to timed caption events.
+    Static call UI labels are also rendered through ASS, so the full video
+    needs only one background encode and one final encode.
+    """
+    speaker = normalize_speaker_label(speaker_label or "Someone who cares")
+    body_size = max(40, min(int(requested_font_size or 54), 62))
+    intro_size = max(42, min(body_size + 4, 66))
+
+    header = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {width}
+PlayResY: {height}
+ScaledBorderAndShadow: yes
+WrapStyle: 2
+
+[V4+ Styles]
+Format: Name,Fontname,Fontsize,PrimaryColour,SecondaryColour,OutlineColour,BackColour,Bold,Italic,Underline,StrikeOut,ScaleX,ScaleY,Spacing,Angle,BorderStyle,Outline,Shadow,Alignment,MarginL,MarginR,MarginV,Encoding
+Style: TopLabel,DejaVu Sans,32,&H00FFFFFF,&H00FFFFFF,&H64000000,&H00000000,-1,0,0,0,100,100,0,0,1,2,0,8,70,70,250,1
+Style: Speaker,DejaVu Sans,56,&H00FFFFFF,&H00FFFFFF,&H70000000,&H00000000,-1,0,0,0,100,100,0,0,1,3,0,8,80,80,315,1
+Style: Intro,DejaVu Sans,{intro_size},&H00FFFFFF,&H00FFFFFF,&H90000000,&H50000000,-1,0,0,0,100,100,0,0,3,3,0,2,105,105,285,1
+Style: Caption,DejaVu Sans,{body_size},&H00FFFFFF,&H00FFFFFF,&H90000000,&H50000000,-1,0,0,0,100,100,0,0,3,3,0,2,105,105,285,1
+
+[Events]
+Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
+"""
+    events: list[str] = []
+
+    def add_event(start: float, end: float, style: str, value: str) -> None:
+        if end <= start + 0.02 or not str(value or "").strip():
+            return
+        events.append(
+            f"Dialogue: 0,{_ass_timestamp(start)},{_ass_timestamp(end)},"
+            f"{style},,0,0,0,,{_ass_escape(value)}"
+        )
+
+    intro_end = min(total_duration, max(0.05, intro_duration))
+    add_event(0.0, intro_end, "TopLabel", "INCOMING CALL")
+    add_event(0.0, intro_end, "Speaker", speaker)
+    add_event(0.0, intro_end, "Intro", intro_text)
+
+    message_ui_start = intro_end
+    if message_ui_start < total_duration:
+        add_event(message_ui_start, total_duration, "TopLabel", "ON THE LINE")
+        add_event(message_ui_start, total_duration, "Speaker", speaker)
+
+    cursor = intro_duration + post_intro_pause
+    caption_count = 0
+
+    for index, (segment, duration) in enumerate(zip(segments, segment_durations)):
+        timeline = aligned_caption_timeline(
+            alignment=segment.alignment,
+            fallback_text=segment.text,
+            segment_duration=duration,
+            max_words=7,
+        )
+
+        local_cursor = 0.0
+        for caption_text, chunk_duration in timeline:
+            start = cursor + local_cursor
+            end = start + chunk_duration
+            if caption_text.strip():
+                add_event(start, end, "Caption", caption_text)
+                caption_count += 1
+            local_cursor += chunk_duration
+
+        cursor += duration
+        if index < len(segment_pauses):
+            cursor += segment_pauses[index]
+
+    output_path.write_text(header + "\n".join(events) + "\n", encoding="utf-8")
+    return caption_count
+
+
 async def render_phone_call_static_job(
     job_id: str, payload: PhoneCallRenderRequest
 ) -> None:
     job_dir = BASE_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
-    set_job(job_id, {"status": "downloading", "progress": 5, "renderer": payload.renderer})
+    set_job(
+        job_id,
+        {"status": "downloading", "progress": 5, "renderer": payload.renderer},
+    )
 
     try:
-        segments = sorted(payload.message.segments, key=lambda item: item.segment_index)
+        segments = sorted(
+            payload.message.segments,
+            key=lambda item: item.segment_index,
+        )
         expected_indexes = list(range(len(segments)))
         actual_indexes = [item.segment_index for item in segments]
         if actual_indexes != expected_indexes:
@@ -1077,22 +1238,38 @@ async def render_phone_call_static_job(
         ]
 
         async with httpx.AsyncClient() as client:
-            await download_file(client, str(payload.intro.audio_url), intro_audio_path)
+            await download_file(
+                client,
+                str(payload.intro.audio_url),
+                intro_audio_path,
+            )
             await asyncio.gather(*[
                 download_file(client, str(segment.audio_url), path)
                 for segment, path in zip(segments, segment_audio_paths)
             ])
 
-        set_job(job_id, {"status": "rendering", "progress": 20, "renderer": payload.renderer})
+        set_job(
+            job_id,
+            {"status": "rendering", "progress": 15, "renderer": payload.renderer},
+        )
 
         intro_duration = probe_duration(intro_audio_path)
-        segment_durations = [probe_duration(path) for path in segment_audio_paths]
+        segment_durations = [
+            probe_duration(path)
+            for path in segment_audio_paths
+        ]
+        post_intro_pause = float(
+            payload.timeline.post_intro_pause_seconds or 0.0
+        )
 
-        # Concatenate intro -> intentional post-intro silence -> message segments.
-        # The pause gives the viewer time to raise the phone after
-        # "Put it on your ear." before the emotional message begins.
-        post_intro_pause = float(payload.timeline.post_intro_pause_seconds or 0.0)
+        segment_pauses = [
+            PHONE_SEGMENT_PAUSES_SECONDS[index]
+            if index < len(PHONE_SEGMENT_PAUSES_SECONDS)
+            else 0.0
+            for index in range(max(0, len(segment_audio_paths) - 1))
+        ]
 
+        # Build exact voice timeline once.
         audio_inputs: list[str] = []
         filter_parts: list[str] = []
         labels: list[str] = []
@@ -1108,7 +1285,8 @@ async def render_phone_call_static_job(
 
         if post_intro_pause > 0:
             audio_inputs.extend([
-                "-f", "lavfi", "-t", f"{post_intro_pause:.3f}",
+                "-f", "lavfi",
+                "-t", f"{post_intro_pause:.3f}",
                 "-i", "anullsrc=r=48000:cl=stereo",
             ])
             filter_parts.append(
@@ -1117,12 +1295,6 @@ async def render_phone_call_static_job(
             )
             labels.append(f"[a{input_index}]")
             input_index += 1
-
-        segment_pauses = [
-            PHONE_SEGMENT_PAUSES_SECONDS[index]
-            if index < len(PHONE_SEGMENT_PAUSES_SECONDS) else 0.0
-            for index in range(max(0, len(segment_audio_paths) - 1))
-        ]
 
         for segment_index, path in enumerate(segment_audio_paths):
             audio_inputs.extend(["-i", str(path)])
@@ -1133,10 +1305,14 @@ async def render_phone_call_static_job(
             labels.append(f"[a{input_index}]")
             input_index += 1
 
-            if segment_index < len(segment_pauses) and segment_pauses[segment_index] > 0:
+            if (
+                segment_index < len(segment_pauses)
+                and segment_pauses[segment_index] > 0
+            ):
                 pause_seconds = segment_pauses[segment_index]
                 audio_inputs.extend([
-                    "-f", "lavfi", "-t", f"{pause_seconds:.3f}",
+                    "-f", "lavfi",
+                    "-t", f"{pause_seconds:.3f}",
                     "-i", "anullsrc=r=48000:cl=stereo",
                 ])
                 filter_parts.append(
@@ -1152,7 +1328,8 @@ async def render_phone_call_static_job(
 
         combined_audio = job_dir / "combined_voice.wav"
         run([
-            "ffmpeg", "-y", *audio_inputs,
+            "ffmpeg", "-y",
+            *audio_inputs,
             "-filter_complex", ";".join(filter_parts),
             "-map", "[aout]",
             "-c:a", "pcm_s16le",
@@ -1160,137 +1337,55 @@ async def render_phone_call_static_job(
         ])
         total_duration = probe_duration(combined_audio)
 
-        visual_clips: list[Path] = []
-        intro_clip = job_dir / "phone_visual_intro.mp4"
-        create_phone_visual_clip(
-            output_path=intro_clip,
-            duration=intro_duration,
+        set_job(
+            job_id,
+            {"status": "rendering", "progress": 30, "renderer": payload.renderer},
+        )
+
+        # Render the procedural background only once for the complete Short.
+        background_video = job_dir / "phone_background.mp4"
+        create_phone_background_clip(
+            output_path=background_video,
+            duration=total_duration,
             width=payload.width,
             height=payload.height,
             fps=payload.fps,
-            speaker_label=payload.message.speaker_label or "You Have A Call",
-            caption_text=payload.intro.full_text,
-            job_dir=job_dir,
-            clip_index=0,
-            is_intro=True,
+        )
+
+        set_job(
+            job_id,
+            {"status": "rendering", "progress": 50, "renderer": payload.renderer},
+        )
+
+        # Build one timestamp-aligned subtitle file for the complete Short.
+        ass_path = job_dir / "phone_captions.ass"
+        rendered_caption_chunks = write_phone_ass_subtitles(
+            ass_path,
+            width=payload.width,
+            height=payload.height,
+            intro_duration=intro_duration,
+            post_intro_pause=post_intro_pause,
+            speaker_label=payload.message.speaker_label or "Someone who cares",
+            intro_text=payload.intro.full_text,
+            segments=segments,
+            segment_durations=segment_durations,
+            segment_pauses=segment_pauses,
+            total_duration=total_duration,
             requested_font_size=payload.font_size,
         )
-        visual_clips.append(intro_clip)
 
-        if post_intro_pause > 0:
-            pause_clip = job_dir / "phone_visual_post_intro_pause.mp4"
-            create_phone_visual_clip(
-                output_path=pause_clip,
-                duration=post_intro_pause,
-                width=payload.width,
-                height=payload.height,
-                fps=payload.fps,
-                speaker_label=payload.message.speaker_label or "You Have A Call",
-                caption_text="",
-                job_dir=job_dir,
-                clip_index=1,
-                is_intro=False,
-                requested_font_size=payload.font_size,
-            )
-            visual_clips.append(pause_clip)
-
-        phone_clip_counter = 2 if post_intro_pause > 0 else 1
-        rendered_caption_chunks = 0
-
-        for segment_position, (segment, duration) in enumerate(
-            zip(segments, segment_durations),
-            start=1,
-        ):
-            caption_timeline = aligned_caption_timeline(
-                alignment=segment.alignment,
-                fallback_text=segment.text,
-                segment_duration=duration,
-                max_words=7,
-            )
-
-            for chunk_position, (caption_chunk, chunk_duration) in enumerate(
-                caption_timeline,
-                start=1,
-            ):
-                target = job_dir / (
-                    f"phone_visual_message_{segment_position}_"
-                    f"caption_{chunk_position}.mp4"
-                )
-                create_phone_visual_clip(
-                    output_path=target,
-                    duration=chunk_duration,
-                    width=payload.width,
-                    height=payload.height,
-                    fps=payload.fps,
-                    speaker_label=(
-                        payload.message.speaker_label or "Someone who cares"
-                    ),
-                    caption_text=caption_chunk,
-                    job_dir=job_dir,
-                    clip_index=phone_clip_counter,
-                    is_intro=False,
-                    requested_font_size=payload.font_size,
-                )
-                visual_clips.append(target)
-                phone_clip_counter += 1
-                rendered_caption_chunks += 1
-
-            if segment_position <= len(segment_pauses):
-                breath_pause = segment_pauses[segment_position - 1]
-                if breath_pause > 0:
-                    pause_target = job_dir / (
-                        f"phone_visual_message_{segment_position}_breath_pause.mp4"
-                    )
-                    create_phone_visual_clip(
-                        output_path=pause_target,
-                        duration=breath_pause,
-                        width=payload.width,
-                        height=payload.height,
-                        fps=payload.fps,
-                        speaker_label=(
-                            payload.message.speaker_label or "Someone who cares"
-                        ),
-                        caption_text="",
-                        job_dir=job_dir,
-                        clip_index=phone_clip_counter,
-                        is_intro=False,
-                        requested_font_size=payload.font_size,
-                    )
-                    visual_clips.append(pause_target)
-                    phone_clip_counter += 1
-
-            progress = 25 + int(
-                (segment_position / max(1, len(segments))) * 50
-            )
-            set_job(
-                job_id,
-                {
-                    "status": "rendering",
-                    "progress": progress,
-                    "renderer": payload.renderer,
-                },
-            )
-
-        concat_path = job_dir / "phone_concat.txt"
-        concat_path.write_text(
-            "\n".join(f"file '{path.as_posix()}'" for path in visual_clips),
-            encoding="utf-8",
+        set_job(
+            job_id,
+            {"status": "rendering", "progress": 65, "renderer": payload.renderer},
         )
-        silent_video = job_dir / "silent.mp4"
-        run([
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0",
-            "-i", str(concat_path), "-c", "copy", str(silent_video),
-        ])
 
         final_video = job_dir / "final.mp4"
         voice_filter = (
             f"loudnorm=I={VOICE_TARGET_LUFS}:TP={VOICE_TRUE_PEAK}:LRA={VOICE_LRA}"
-            if ENABLE_AUDIO_NORMALIZATION else "anull"
+            if ENABLE_AUDIO_NORMALIZATION
+            else "anull"
         )
 
-        # Brighter coastal ambience: audible surf, soft high-frequency air,
-        # and sparse bird-like chirps. It remains underneath the narration but
-        # is intentionally audible on phone speakers.
         ambient_surf_source = (
             "anoisesrc=color=brown:amplitude=0.20:r=48000,"
             "highpass=f=70,lowpass=f=420"
@@ -1306,7 +1401,11 @@ async def render_phone_call_static_job(
             "if(lt(mod(t+1.9,8.1),0.12),0.040,"
             "if(lt(mod(t+3.2,10.2),0.10),0.032,0)))"
         )
+
+        # One final FFmpeg pass:
+        # background + complete ASS subtitle track + narration + ambience.
         filter_complex = (
+            f"[0:v]subtitles='{ass_path.as_posix()}'[vout];"
             f"[1:a]{voice_filter},aformat=channel_layouts=stereo[voice];"
             f"[2:a]volume={PHONE_AMBIENT_VOLUME},"
             f"afade=t=in:st=0:d=1.2,"
@@ -1327,18 +1426,25 @@ async def render_phone_call_static_job(
 
         run([
             "ffmpeg", "-y",
-            "-i", str(silent_video),
+            "-i", str(background_video),
             "-i", str(combined_audio),
-            "-f", "lavfi", "-t", f"{total_duration:.3f}",
+            "-f", "lavfi",
+            "-t", f"{total_duration:.3f}",
             "-i", ambient_surf_source,
-            "-f", "lavfi", "-t", f"{total_duration:.3f}",
+            "-f", "lavfi",
+            "-t", f"{total_duration:.3f}",
             "-i", ambient_air_source,
-            "-f", "lavfi", "-t", f"{total_duration:.3f}",
+            "-f", "lavfi",
+            "-t", f"{total_duration:.3f}",
             "-i", ambient_bird_source,
             "-filter_complex", filter_complex,
-            "-map", "0:v:0",
+            "-map", "[vout]",
             "-map", "[aout]",
-            "-c:v", "copy",
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-crf", "22",
+            "-threads", "1",
+            "-pix_fmt", "yuv420p",
             "-c:a", "aac",
             "-b:a", "192k",
             "-shortest",
@@ -1346,10 +1452,19 @@ async def render_phone_call_static_job(
             str(final_video),
         ])
 
+        set_job(
+            job_id,
+            {"status": "rendering", "progress": 90, "renderer": payload.renderer},
+        )
+
         thumbnail_path = job_dir / "thumbnail.jpg"
         run([
-            "ffmpeg", "-y", "-ss", "0.2", "-i", str(final_video),
-            "-frames:v", "1", "-q:v", "3", str(thumbnail_path),
+            "ffmpeg", "-y",
+            "-ss", "0.2",
+            "-i", str(final_video),
+            "-frames:v", "1",
+            "-q:v", "3",
+            str(thumbnail_path),
         ])
 
         set_job(job_id, {
@@ -1359,14 +1474,21 @@ async def render_phone_call_static_job(
             "duration": round(total_duration, 3),
             "intro_audio_duration": round(intro_duration, 3),
             "post_intro_pause_seconds": round(post_intro_pause, 3),
-            "message_audio_durations": [round(value, 3) for value in segment_durations],
+            "message_audio_durations": [
+                round(value, 3)
+                for value in segment_durations
+            ],
             "message_segment_count": len(segments),
             "caption_chunk_count": rendered_caption_chunks,
-            "caption_timing_mode": "elevenlabs_alignment_v1",
-            "visual_style": "procedural_sunny_blurred_sea_v1",
+            "caption_timing_mode": "elevenlabs_alignment_ass_v2",
+            "visual_style": "procedural_sunny_blurred_sea_v2",
+            "render_strategy": "single_background_single_ass_pass_v1",
             "ambient_style": "procedural_sunny_ocean_birds_v1",
             "ambient_volume": PHONE_AMBIENT_VOLUME,
-            "message_segment_pauses_seconds": [round(value, 3) for value in segment_pauses],
+            "message_segment_pauses_seconds": [
+                round(value, 3)
+                for value in segment_pauses
+            ],
             "download_url": f"/download/{job_id}",
             "thumbnail_url": f"/thumbnail/{job_id}",
         })
@@ -1378,7 +1500,6 @@ async def render_phone_call_static_job(
             "renderer": payload.renderer,
             "error": str(exc),
         })
-
 
 def run_async_job_in_thread(task, job_id: str, validated_payload) -> None:
     """Run one async renderer in its own thread/event loop.
@@ -1400,7 +1521,7 @@ def run_async_job_in_thread(task, job_id: str, validated_payload) -> None:
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "Channel Factory FFmpeg Renderer", "version": "3.4.2", "renderers": ["documentary_v1", "phone_call_static_v1"]}
+    return {"ok": True, "service": "Channel Factory FFmpeg Renderer", "version": "3.5.0", "renderers": ["documentary_v1", "phone_call_static_v1"]}
 
 
 @app.get("/health")
