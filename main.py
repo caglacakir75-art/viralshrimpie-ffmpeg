@@ -15,7 +15,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, HttpUrl
 
-app = FastAPI(title="Channel Factory FFmpeg Renderer", version="3.6.0")
+app = FastAPI(title="Channel Factory FFmpeg Renderer", version="3.6.1")
 
 BASE_DIR = Path(os.getenv("JOB_DIR", "/tmp/viralshrimpie_jobs"))
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -55,10 +55,12 @@ PHONE_SEGMENT_PAUSES_SECONDS = (0.45, 0.65, 0.75)
 # YouHaveaCall sonic branding. The ring sits under the spoken intro.
 # After the final intro words, a tiny connect chirp + pickup click + short
 # human-feeling silence replaces the old 3.5 second dead-air pause.
+PHONE_PRE_INTRO_RING_SECONDS = 1.35
+PHONE_PRE_INTRO_RING_VOLUME = 0.18
 PHONE_RING_VOLUME = 0.105
 PHONE_CONNECT_TONE_SECONDS = 0.22
 PHONE_PICKUP_CLICK_SECONDS = 0.08
-PHONE_POST_PICKUP_GAP_SECONDS = 0.55
+PHONE_POST_PICKUP_GAP_SECONDS = 1.00
 
 ENABLE_CAPTION_SLIDE = False
 CAPTION_SLIDE_SECONDS = 0.22
@@ -1132,18 +1134,21 @@ def create_phone_intro_with_ring(
     output_path: Path,
     duration: float,
 ) -> None:
-    """Mix the fixed YouHaveaCall ring underneath the spoken intro.
+    """Mix the recognizable call ring underneath the spoken intro.
 
-    The ring is deliberately recognizable but quiet enough that the words
-    remain clear on phone speakers. It pulses rather than playing constantly.
+    The first standalone ring is handled separately. During the spoken intro,
+    the ring remains audible and only eases down slightly instead of
+    disappearing.
     """
     ring_gate = "if(lt(mod(t,1.45),0.62),1,0)"
+    ring_fade = "if(lt(t,1.6),1.0-(0.22*t/1.6),0.78)"
     filter_complex = (
         f"[0:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo[intro];"
         f"[1:a][2:a]amix=inputs=2:normalize=0,volume={PHONE_RING_VOLUME},"
         f"volume='{ring_gate}':eval=frame,"
-        f"afade=t=in:st=0:d=0.06,"
-        f"afade=t=out:st={max(0.0, duration - 0.12):.3f}:d=0.12,"
+        f"volume='{ring_fade}':eval=frame,"
+        f"afade=t=in:st=0:d=0.04,"
+        f"afade=t=out:st={max(0.0, duration - 0.10):.3f}:d=0.10,"
         f"aformat=channel_layouts=stereo[ring];"
         f"[intro][ring]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[aout]"
     )
@@ -1156,6 +1161,32 @@ def create_phone_intro_with_ring(
         "-f", "lavfi", "-t", f"{duration:.3f}",
         "-i", "sine=frequency=480:sample_rate=48000",
         "-filter_complex", filter_complex,
+        "-map", "[aout]",
+        "-c:a", "pcm_s16le",
+        str(output_path),
+    ])
+
+
+def create_phone_pre_intro_ring(output_path: Path) -> None:
+    """Create one clearly audible ring before the intro voice starts."""
+    ring_gate = "if(lt(mod(t,1.45),0.62),1,0)"
+    run([
+        "ffmpeg", "-y",
+        "-f", "lavfi",
+        "-t", f"{PHONE_PRE_INTRO_RING_SECONDS:.3f}",
+        "-i", "sine=frequency=440:sample_rate=48000",
+        "-f", "lavfi",
+        "-t", f"{PHONE_PRE_INTRO_RING_SECONDS:.3f}",
+        "-i", "sine=frequency=480:sample_rate=48000",
+        "-filter_complex",
+        (
+            f"[0:a][1:a]amix=inputs=2:normalize=0,"
+            f"volume={PHONE_PRE_INTRO_RING_VOLUME},"
+            f"volume='{ring_gate}':eval=frame,"
+            f"afade=t=in:st=0:d=0.04,"
+            f"afade=t=out:st={max(0.0, PHONE_PRE_INTRO_RING_SECONDS - 0.10):.3f}:d=0.10,"
+            f"aformat=channel_layouts=stereo[aout]"
+        ),
         "-map", "[aout]",
         "-c:a", "pcm_s16le",
         str(output_path),
@@ -1204,6 +1235,7 @@ def write_phone_ass_subtitles(
     width: int,
     height: int,
     intro_duration: float,
+    pre_intro_ring: float,
     post_intro_pause: float,
     speaker_label: str,
     intro_text: str,
@@ -1250,17 +1282,22 @@ Format: Layer,Start,End,Style,Name,MarginL,MarginR,MarginV,Effect,Text
             f"{style},,0,0,0,,{_ass_escape(value)}"
         )
 
-    intro_end = min(total_duration, max(0.05, intro_duration))
+    intro_start = max(0.0, pre_intro_ring)
+    intro_end = min(
+        total_duration,
+        intro_start + max(0.05, intro_duration)
+    )
+
     add_event(0.0, intro_end, "TopLabel", "INCOMING CALL")
-    add_event(0.0, intro_end, "Speaker", speaker)
-    add_event(0.0, intro_end, "Intro", intro_text)
+    add_event(intro_start, intro_end, "Speaker", speaker)
+    add_event(intro_start, intro_end, "Intro", intro_text)
 
     message_ui_start = intro_end
     if message_ui_start < total_duration:
         add_event(message_ui_start, total_duration, "TopLabel", "ON THE LINE")
         add_event(message_ui_start, total_duration, "Speaker", speaker)
 
-    cursor = intro_duration + post_intro_pause
+    cursor = pre_intro_ring + intro_duration + post_intro_pause
     caption_count = 0
 
     for index, (segment, duration) in enumerate(zip(segments, segment_durations)):
@@ -1349,10 +1386,12 @@ async def render_phone_call_static_job(
             + PHONE_POST_PICKUP_GAP_SECONDS
         )
 
+        pre_intro_ring_path = job_dir / "phone_pre_intro_ring.wav"
         intro_with_ring_path = job_dir / "intro_with_ring.wav"
         connect_tone_path = job_dir / "phone_connect.wav"
         pickup_click_path = job_dir / "phone_pickup.wav"
 
+        create_phone_pre_intro_ring(pre_intro_ring_path)
         create_phone_intro_with_ring(
             intro_audio_path=intro_audio_path,
             output_path=intro_with_ring_path,
@@ -1374,7 +1413,16 @@ async def render_phone_call_static_job(
         labels: list[str] = []
         input_index = 0
 
-        # Intro voice already contains the ringing layer.
+        # One clear ring is heard before the intro voice enters.
+        audio_inputs.extend(["-i", str(pre_intro_ring_path)])
+        filter_parts.append(
+            f"[{input_index}:a]aresample=48000,"
+            f"aformat=sample_fmts=fltp:channel_layouts=stereo[a{input_index}]"
+        )
+        labels.append(f"[a{input_index}]")
+        input_index += 1
+
+        # Intro voice then enters while the ring continues underneath.
         audio_inputs.extend(["-i", str(intro_with_ring_path)])
         filter_parts.append(
             f"[{input_index}:a]aresample=48000,"
@@ -1483,6 +1531,7 @@ async def render_phone_call_static_job(
             width=payload.width,
             height=payload.height,
             intro_duration=intro_duration,
+            pre_intro_ring=PHONE_PRE_INTRO_RING_SECONDS,
             post_intro_pause=post_intro_pause,
             speaker_label=payload.message.speaker_label or "Someone who cares",
             intro_text=payload.intro.full_text,
@@ -1594,6 +1643,8 @@ async def render_phone_call_static_job(
             "intro_audio_duration": round(intro_duration, 3),
             "requested_post_intro_pause_seconds": round(requested_post_intro_pause, 3),
             "post_intro_pause_seconds": round(post_intro_pause, 3),
+            "phone_pre_intro_ring_seconds": PHONE_PRE_INTRO_RING_SECONDS,
+            "phone_pre_intro_ring_volume": PHONE_PRE_INTRO_RING_VOLUME,
             "phone_ring_under_intro": True,
             "phone_ring_volume": PHONE_RING_VOLUME,
             "phone_connect_tone_seconds": PHONE_CONNECT_TONE_SECONDS,
@@ -1607,7 +1658,7 @@ async def render_phone_call_static_job(
             "caption_chunk_count": rendered_caption_chunks,
             "caption_timing_mode": "elevenlabs_alignment_ass_v2",
             "visual_style": "procedural_sunny_blurred_sea_v2",
-            "render_strategy": "single_background_single_ass_pass_v2_sonic_intro",
+            "render_strategy": "single_background_single_ass_pass_v3_sonic_intro",
             "ambient_style": "procedural_sunny_ocean_birds_v1",
             "ambient_volume": PHONE_AMBIENT_VOLUME,
             "message_segment_pauses_seconds": [
@@ -1646,7 +1697,7 @@ def run_async_job_in_thread(task, job_id: str, validated_payload) -> None:
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "Channel Factory FFmpeg Renderer", "version": "3.6.0", "renderers": ["documentary_v1", "phone_call_static_v1"]}
+    return {"ok": True, "service": "Channel Factory FFmpeg Renderer", "version": "3.6.1", "renderers": ["documentary_v1", "phone_call_static_v1"]}
 
 
 @app.get("/health")
