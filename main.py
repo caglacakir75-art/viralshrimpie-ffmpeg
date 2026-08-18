@@ -15,7 +15,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, HttpUrl
 
-app = FastAPI(title="Channel Factory FFmpeg Renderer", version="3.7.0")
+app = FastAPI(title="Channel Factory FFmpeg Renderer", version="3.7.1")
 
 BASE_DIR = Path(os.getenv("JOB_DIR", "/tmp/viralshrimpie_jobs"))
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -53,10 +53,10 @@ PHONE_AMBIENT_VOLUME = 0.115
 PHONE_SEGMENT_PAUSES_SECONDS = (0.45, 0.65, 0.75)
 
 # YouHaveaCall sonic branding uses fixed WAV assets shipped with the renderer.
-SFX_DIR = Path(__file__).resolve().parent / "assets" / "youhaveacall"
-PHONE_RING_ASSET = SFX_DIR / "phone_ring.wav"
-PHONE_CONNECT_ASSET = SFX_DIR / "phone_connect.wav"
-PHONE_PICKUP_ASSET = SFX_DIR / "phone_pickup.wav"
+BASE_PATH = Path(__file__).resolve().parent
+PHONE_RING_ASSET = BASE_PATH / "phone_ring.wav"
+PHONE_CONNECT_ASSET = BASE_PATH / "phone_connect.wav"
+PHONE_PICKUP_ASSET = BASE_PATH / "phone_pickup.wav"
 
 # One full ring cycle is heard alone before the intro voice enters.
 # The same ring continues more quietly underneath the intro.
@@ -1701,7 +1701,7 @@ def run_async_job_in_thread(task, job_id: str, validated_payload) -> None:
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "Channel Factory FFmpeg Renderer", "version": "3.7.0", "renderers": ["documentary_v1", "phone_call_static_v1"]}
+    return {"ok": True, "service": "Channel Factory FFmpeg Renderer", "version": "3.7.1", "renderers": ["documentary_v1", "phone_call_static_v1"]}
 
 
 @app.get("/health")
