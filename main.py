@@ -15,7 +15,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field, HttpUrl
 
-app = FastAPI(title="Channel Factory FFmpeg Renderer", version="3.7.1")
+app = FastAPI(title="Channel Factory FFmpeg Renderer", version="3.7.2")
 
 BASE_DIR = Path(os.getenv("JOB_DIR", "/tmp/viralshrimpie_jobs"))
 BASE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1701,7 +1701,7 @@ def run_async_job_in_thread(task, job_id: str, validated_payload) -> None:
 
 @app.get("/")
 def root():
-    return {"ok": True, "service": "Channel Factory FFmpeg Renderer", "version": "3.7.1", "renderers": ["documentary_v1", "phone_call_static_v1"]}
+    return {"ok": True, "service": "Channel Factory FFmpeg Renderer", "version": "3.7.2", "renderers": ["documentary_v1", "phone_call_static_v1"]}
 
 
 @app.get("/health")
@@ -1741,10 +1741,50 @@ async def create_render(payload: dict[str, Any]):
 
 
 @app.get("/status/{job_id}")
-def get_status(job_id: str):
+def get_status(job_id: str, peek: bool = False):
+    """Return job status.
+
+    Default behaviour intentionally waits until the render reaches a terminal
+    state (succeeded/failed), restoring the simple n8n flow:
+
+        Render -> Wait -> Status -> Video Download
+
+    This avoids n8n polling loops and prevents Video Download from firing while
+    the job is still rendering.
+
+    For manual/debug checks, use:
+        /status/{job_id}?peek=true
+    to return the current status immediately.
+    """
+    terminal_states = {"succeeded", "failed"}
+    max_wait_seconds = 270
+    poll_interval_seconds = 1.0
+
     job = get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+
+    if peek:
+        return {"job_id": job_id, **job}
+
+    started_at = time.monotonic()
+
+    while job.get("status") not in terminal_states:
+        if time.monotonic() - started_at >= max_wait_seconds:
+            # Do not fabricate success. Return the current state cleanly.
+            # In normal operation renders should finish before this limit.
+            return {
+                "job_id": job_id,
+                **job,
+                "status_wait_timed_out": True,
+            }
+
+        time.sleep(poll_interval_seconds)
+
+        refreshed = get_job(job_id)
+        if refreshed:
+            job = refreshed
+
     return {"job_id": job_id, **job}
 
 
@@ -1778,8 +1818,24 @@ def download(job_id: str):
     job = get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+
+    # Small safety window: if n8n reaches Download a fraction too early,
+    # wait briefly instead of immediately returning 409.
+    if job.get("status") not in {"succeeded", "failed"}:
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            time.sleep(0.5)
+            refreshed = get_job(job_id)
+            if refreshed:
+                job = refreshed
+            if job.get("status") in {"succeeded", "failed"}:
+                break
+
     if job.get("status") != "succeeded":
-        raise HTTPException(status_code=409, detail=f"Job status: {job.get('status')}")
+        detail = f"Job status: {job.get('status')}"
+        if job.get("error"):
+            detail += f" | {job.get('error')}"
+        raise HTTPException(status_code=409, detail=detail)
 
     final_video = BASE_DIR / job_id / "final.mp4"
     if not final_video.exists():
